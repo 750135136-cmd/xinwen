@@ -1,210 +1,303 @@
-import os
-import sys
 import re
+import copy
 import asyncio
-import threading
 from datetime import datetime
-from collections import OrderedDict
-from telethon import TelegramClient, events
-from telethon.sessions import StringSession
-from telethon.errors import FloodWaitError
-from telethon.tl.types import (
-    MessageMediaPhoto, MessageMediaDocument, DocumentAttributeVideo,
-    Channel, Chat
-)
 
-# ====================== 【直接写死配置】无需任何环境变量 ======================
+from telethon import TelegramClient, events, utils
+from telethon.errors import FloodWaitError
+from telethon.tl.types import MessageEntityBold
+
+# ========= 配置 =========
 API_ID = 25559912
 API_HASH = "22d3bb9665ad7e6a86e89c1445672e07"
-STRING_SESSION = ""
-SESSION_NAME = "session"
-SOURCE_CHANNELS = "@djrrw"          # 监听频道
-TARGET_CHANNEL = "@djrrv"            # 目标频道
-RESTART_INTERVAL_HOURS = 20
-BLOCK_KEYWORDS = ["付费广告"]
-FOOTER_TEXT = "关注华人新闻: @hrxxw 投稿: @LimTGbot"
-# =========================================================================
 
-TG_MAX_TEXT_LENGTH = 4096
-MAX_PROCESSED_CACHE = 10000
-URL_REGEX = re.compile(r'(https?://\S+)|(t\.me/\S+)|(telegram\.me/\S+)', re.IGNORECASE)
+SESSION = "session"   # 根目录下的 session.session
 
-SOURCE_CHAT_IDS = []
-TARGET_CHAT_ID = None
-PROCESSED_MESSAGE_IDS = OrderedDict()
-RESTART_TIMER = None
+SOURCE = "@djrrw"     # 监听频道用户名 / 可解析频道
+TARGET = "@djrrv"     # 目标频道用户名 / 可解析频道
 
-client = TelegramClient(
-    session=StringSession(STRING_SESSION) if STRING_SESSION else SESSION_NAME,
-    api_id=API_ID,
-    api_hash=API_HASH,
-    connection_retries=None,
-    retry_delay=5,
-    auto_reconnect=True,
-    timeout=30,
-    flood_sleep_threshold=120
-)
+RESTART_TIME = 72000  # 20小时
 
-# 按钮检测（正常可用）
-def count_buttons(reply_markup):
-    if not reply_markup or not hasattr(reply_markup, 'rows'):
+TAIL_TEXT = "关注华人新闻: @hrxxw 投稿: @LimTGbot"
+
+client = TelegramClient(SESSION, API_ID, API_HASH)
+
+SOURCE_ID = None
+TARGET_ID = None
+
+
+# ========= 日志 =========
+def log(msg: str):
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
+
+
+# ========= 基础判断 =========
+def has_link(text: str) -> bool:
+    if not text:
+        return False
+    return bool(re.search(r"(https?://|www\.)", text, re.IGNORECASE))
+
+
+def has_paid_ad(text: str) -> bool:
+    return bool(text and "付费广告" in text)
+
+
+def count_buttons(msg) -> int:
+    if not getattr(msg, "buttons", None):
         return 0
-    return sum(len(row.buttons) for row in reply_markup.rows)
+    return sum(len(row) for row in msg.buttons)
 
-# 验证媒体
-def is_valid_media(media):
-    if not media: return False
-    if isinstance(media, MessageMediaPhoto): return True
-    if isinstance(media, MessageMediaDocument):
-        return any(isinstance(a, DocumentAttributeVideo) for a in media.document.attributes)
-    return False
 
-# 文本处理
-def process_text(text):
-    if not text: return ""
-    paragraphs = text.split("\n\n")
-    if len(paragraphs) >= 2:
-        last = paragraphs[-1]
-        if "@" in last or URL_REGEX.search(last):
-            paragraphs = paragraphs[:-1]
-    return "\n\n".join(paragraphs) + "\n\n" + FOOTER_TEXT
+def pick_text_from_message(msg):
+    txt = getattr(msg, "raw_text", None) or getattr(msg, "message", None) or ""
+    return txt, getattr(msg, "entities", None)
 
-# 拦截检查
-def has_blocked(text):
-    for kw in BLOCK_KEYWORDS:
-        if kw in text: return True, f"拦截关键词：{kw}"
-    if URL_REGEX.search(text): return True, "含链接"
-    return False, ""
 
-# 去重
-def add_msg_id(mid):
-    if mid in PROCESSED_MESSAGE_IDS:
-        PROCESSED_MESSAGE_IDS.move_to_end(mid)
-        return
-    if len(PROCESSED_MESSAGE_IDS) >= MAX_PROCESSED_CACHE:
-        PROCESSED_MESSAGE_IDS.popitem(last=False)
-    PROCESSED_MESSAGE_IDS[mid] = True
+def pick_caption_from_album(event):
+    """
+    相册正文提取：
+    1) event.text
+    2) event.messages 逐条找
+    3) original_update 兜底
+    """
+    txt = getattr(event, "text", None) or ""
+    if txt.strip():
+        return txt, None
 
-# 定时重启
-def auto_restart():
-    global RESTART_TIMER
-    print(f"[重启] {RESTART_INTERVAL_HOURS}小时后重启")
-    RESTART_TIMER = threading.Timer(RESTART_INTERVAL_HOURS*3600, sys.exit)
-    RESTART_TIMER.daemon = True
-    RESTART_TIMER.start()
-
-# 频道解析（自动转-100标准ID）
-async def get_id(channel_input, is_target=False):
-    try:
-        if not channel_input.startswith("@"):
-            channel_input = f"@{channel_input}"
-        ent = await client.get_entity(channel_input)
-        if isinstance(ent, Channel):
-            cid = int(f"-100{ent.id}")
-        else:
-            cid = ent.id
-        print(f"✅ 解析成功：{channel_input} → {cid} | {ent.title}")
-        return cid, ent
-    except Exception as e:
-        print(f"❌ 解析失败：{e}")
-        if is_target: sys.exit(1)
-        return None, None
-
-# 单条消息
-async def on_msg(event):
-    chat = event.chat_id
-    msg = event.message
-    mid = msg.id
-    if msg.grouped_id: return
-    if chat not in SOURCE_CHAT_IDS: return
-
-    btn = count_buttons(msg.reply_markup)
-    print(f"\n📩 单条消息 ID:{mid} | 按钮:{btn}")
-
-    if mid in PROCESSED_MESSAGE_IDS: return
-    add_msg_id(mid)
-
-    if not msg.text or not is_valid_media(msg.media):
-        print("🚫 无文本/无媒体")
-        return
-    if 1 <= btn <=3:
-        print(f"🚫 拦截按钮 {btn}个")
-        return
-
-    txt = process_text(msg.text)
-    block, _ = has_blocked(txt)
-    if block:
-        print("🚫 内容拦截")
-        return
+    for m in event.messages:
+        t = getattr(m, "raw_text", None) or getattr(m, "message", None) or ""
+        if t.strip():
+            return t, getattr(m, "entities", None)
 
     try:
-        await client.send_message(TARGET_CHAT_ID, file=msg.media, message=txt, link_preview=False)
-        print("✅ 单条发送成功")
-    except Exception as e:
-        print(f"❌ 发送失败：{e}")
+        orig = getattr(event, "original_update", None)
+        if orig and getattr(orig, "message", None):
+            msg = orig.message
+            t = getattr(msg, "message", None) or ""
+            if t.strip():
+                return t, getattr(msg, "entities", None)
+    except Exception:
+        pass
 
-# 相册消息（修复发送权限问题）
-async def on_album(event):
-    chat = event.chat_id
-    main = event.messages[0]
-    mid = main.id
-    if chat not in SOURCE_CHAT_IDS: return
+    return "", None
 
-    btn = count_buttons(main.reply_markup)
-    print(f"\n🖼️  相册消息 ID:{mid} | 按钮:{btn}")
 
-    if mid in PROCESSED_MESSAGE_IDS: return
-    add_msg_id(mid)
+# ========= 尾部处理：只改最后一段 =========
+def trim_tail_keep_entities(text: str, entities=None):
+    """
+    规则：
+    - 只检查最后一个空行后面的尾部块
+    - 如果尾部块含 @ 或链接，则删除整段尾部块
+    - 替换成固定文案
+    - 前面的引用框/加粗等实体尽量保留
+    """
+    if not text:
+        return text, []
 
-    if not main.text:
-        print("🚫 无文本")
-        return
-    media = [m.media for m in event.messages if is_valid_media(m.media)]
-    if not media:
-        print("🚫 无有效媒体")
-        return
-    if 1 <= btn <=3:
-        print(f"🚫 拦截按钮 {btn}个")
-        return
+    raw = text.rstrip()
+    entities = list(entities or [])
 
-    txt = process_text(main.text)
-    block, _ = has_blocked(txt)
-    if block:
-        print("🚫 内容拦截")
-        return
+    matches = list(re.finditer(r"\n\s*\n", raw))
+    if not matches:
+        return raw, entities
 
-    # 【修复】频道专用发送方式，100%能发
+    last_sep = matches[-1]
+    prefix = raw[:last_sep.start()].rstrip()
+    tail = raw[last_sep.end():].strip()
+
+    if not tail or ("@" not in tail and not has_link(tail)):
+        return raw, entities
+
+    new_text = prefix + "\n\n" + TAIL_TEXT
+    prefix_len = len(prefix)
+
+    new_entities = []
+    for ent in entities:
+        start = ent.offset
+        end = ent.offset + ent.length
+
+        # 完全在前半段：保留
+        if end <= prefix_len:
+            new_entities.append(copy.copy(ent))
+            continue
+
+        # 完全在尾部：删除
+        if start >= prefix_len:
+            continue
+
+        # 跨越边界：截断
+        ent2 = copy.copy(ent)
+        ent2.length = max(0, prefix_len - start)
+        if ent2.length > 0:
+            new_entities.append(ent2)
+
+    # 给替换后的尾部加粗
+    # 注意：这里不使用 Markdown，不会显示 * 号
+    new_entities.append(MessageEntityBold(offset=len(prefix) + 2, length=len(TAIL_TEXT)))
+
+    return new_text, new_entities
+
+
+# ========= 发送封装：不使用 Markdown 解析 =========
+async def safe_send(*, target, text, media, entities=None):
     try:
-        await client.send_media_group(TARGET_CHAT_ID, files=media)
-        await client.send_message(TARGET_CHAT_ID, message=txt, link_preview=False)
-        print("✅ 相册发送成功")
-    except Exception as e:
-        print(f"❌ 发送失败：{e}")
+        await client.send_file(
+            target,
+            file=media,
+            caption=text,
+            formatting_entities=entities,
+            parse_mode=None,
+            link_preview=False
+        )
 
-async def main():
-    global SOURCE_CHAT_IDS, TARGET_CHAT_ID
-    await client.start()
+    except FloodWaitError as e:
+        log(f"触发 FloodWait：需要等待 {e.seconds} 秒")
+
+        if e.seconds > 60:
+            log("等待时间过长，退出进程，交由 Railway 自动重启")
+            await client.disconnect()
+            raise SystemExit(1)
+
+        await asyncio.sleep(e.seconds)
+
+        await client.send_file(
+            target,
+            file=media,
+            caption=text,
+            formatting_entities=entities,
+            parse_mode=None,
+            link_preview=False
+        )
+
+
+# ========= 相册处理 =========
+@client.on(events.Album())
+async def album_handler(event):
+    try:
+        if SOURCE_ID is not None and event.chat_id != SOURCE_ID:
+            return
+
+        msgs = event.messages
+        first = msgs[0]
+        btn_count = count_buttons(first)
+
+        text, entities = pick_caption_from_album(event)
+
+        log(f"收到相册 | chat_id:{event.chat_id} | 媒体数:{len(msgs)} | 文本长度:{len(text)} | 按钮:{btn_count}")
+
+        if not text.strip():
+            log("拦截: 相册无文字")
+            return
+
+        if has_paid_ad(text):
+            log("拦截: 含付费广告")
+            return
+
+        if 1 <= btn_count <= 3:
+            log(f"拦截: 按钮数量 {btn_count}（1~3 禁止）")
+            return
+
+        new_text, new_entities = trim_tail_keep_entities(text, entities)
+
+        if has_link(new_text):
+            log("拦截: 尾部处理后仍包含链接")
+            return
+
+        await safe_send(
+            target=TARGET_ID,
+            text=new_text,
+            media=[m.media for m in msgs],
+            entities=new_entities
+        )
+
+        log(f"转发成功: 相册 | 实际媒体数:{len(msgs)}")
+
+    except Exception as e:
+        log(f"相册处理错误: {e}")
+
+
+# ========= 单条处理 =========
+@client.on(events.NewMessage(incoming=True))
+async def handler(event):
+    try:
+        if event.grouped_id:
+            return
+
+        if SOURCE_ID is not None and event.chat_id != SOURCE_ID:
+            return
+
+        msg = event.message
+        text, entities = pick_text_from_message(msg)
+        btn_count = count_buttons(msg)
+
+        log(f"收到消息 | chat_id:{event.chat_id} | 文本长度:{len(text)} | 按钮:{btn_count} | 有媒体:{bool(msg.media)}")
+
+        if not msg.media:
+            log("拦截: 无媒体")
+            return
+
+        if not text.strip():
+            log("拦截: 无文字")
+            return
+
+        if has_paid_ad(text):
+            log("拦截: 含付费广告")
+            return
+
+        if 1 <= btn_count <= 3:
+            log(f"拦截: 按钮数量 {btn_count}（1~3 禁止）")
+            return
+
+        new_text, new_entities = trim_tail_keep_entities(text, entities)
+
+        if has_link(new_text):
+            log("拦截: 尾部处理后仍包含链接")
+            return
+
+        await safe_send(
+            target=TARGET_ID,
+            text=new_text,
+            media=msg.media,
+            entities=new_entities
+        )
+
+        log("转发成功: 单条消息")
+
+    except Exception as e:
+        log(f"消息处理错误: {e}")
+
+
+# ========= 20小时自动重启 =========
+async def auto_restart():
+    await asyncio.sleep(RESTART_TIME)
+    log("20小时到，执行自动重启")
+    await client.disconnect()
+    raise SystemExit(0)
+
+
+# ========= 启动前解析实体 =========
+async def resolve_entities():
+    global SOURCE_ID, TARGET_ID
+
+    source_entity = await client.get_entity(SOURCE)
+    target_entity = await client.get_entity(TARGET)
+
+    SOURCE_ID = utils.get_peer_id(source_entity)
+    TARGET_ID = utils.get_peer_id(target_entity)
+
     me = await client.get_me()
-    print(f"✅ 登录成功：{me.first_name}")
 
-    # 解析监听频道
-    src_id, _ = await get_id(SOURCE_CHANNELS)
-    if src_id:
-        SOURCE_CHAT_IDS = [src_id]
+    log(f"启动成功 | 登录账号: {me.username or me.id}")
+    log(f"监听频道: {getattr(source_entity, 'title', '')} | username: @{getattr(source_entity, 'username', None) or '无公开用户名'} | id: {SOURCE_ID}")
+    log(f"目标频道: {getattr(target_entity, 'title', '')} | username: @{getattr(target_entity, 'username', None) or '无公开用户名'} | id: {TARGET_ID}")
 
-    # 解析目标频道
-    TARGET_CHAT_ID, _ = await get_id(TARGET_CHANNEL, is_target=True)
 
-    # 注册监听
-    client.add_event_handler(on_msg, events.NewMessage())
-    client.add_event_handler(on_album, events.Album())
-    print("✅ 监听已启动")
-    auto_restart()
-
+# ========= 主程序 =========
+async def main():
+    await client.start()
+    await resolve_entities()
+    asyncio.create_task(auto_restart())
     await client.run_until_disconnected()
 
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        sys.exit(0)
+
+client.loop.run_until_complete(main())
