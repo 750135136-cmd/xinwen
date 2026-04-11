@@ -132,41 +132,77 @@ def trim_tail_keep_entities(text: str, entities=None):
             new_entities.append(ent2)
 
     # 给替换后的尾部加粗
-    # 注意：这里不使用 Markdown，不会显示 * 号
     new_entities.append(MessageEntityBold(offset=len(prefix) + 2, length=len(TAIL_TEXT)))
 
     return new_text, new_entities
 
 
-# ========= 发送封装：不使用 Markdown 解析 =========
-async def safe_send(*, target, text, media, entities=None):
+# ========= 发送封装 =========
+async def safe_send_single(*, target, text, media, entities=None):
+    """
+    单张图片/视频：caption + formatting_entities 直接发送
+    """
     try:
         await client.send_file(
             target,
             file=media,
             caption=text,
             formatting_entities=entities,
+            link_preview=False,
             parse_mode=None,
-            link_preview=False
         )
-
     except FloodWaitError as e:
         log(f"触发 FloodWait：需要等待 {e.seconds} 秒")
-
         if e.seconds > 60:
             log("等待时间过长，退出进程，交由 Railway 自动重启")
             await client.disconnect()
             raise SystemExit(1)
-
         await asyncio.sleep(e.seconds)
-
         await client.send_file(
             target,
             file=media,
             caption=text,
             formatting_entities=entities,
+            link_preview=False,
             parse_mode=None,
-            link_preview=False
+        )
+
+
+async def safe_send_album(*, target, files, text, entities=None):
+    """
+    相册/多媒体组：
+    Telethon 要求 caption 可为 list[str]，
+    formatting_entities 要为 list[list[MessageEntity...]]，
+    每个内层列表和对应文件一一匹配。
+    """
+    try:
+        captions = [text] + [""] * (len(files) - 1)
+        entity_groups = [list(entities or [])] + [[] for _ in range(len(files) - 1)]
+
+        await client.send_file(
+            target,
+            file=files,
+            caption=captions,
+            formatting_entities=entity_groups,
+            link_preview=False,
+            parse_mode=None,
+        )
+    except FloodWaitError as e:
+        log(f"触发 FloodWait：需要等待 {e.seconds} 秒")
+        if e.seconds > 60:
+            log("等待时间过长，退出进程，交由 Railway 自动重启")
+            await client.disconnect()
+            raise SystemExit(1)
+        await asyncio.sleep(e.seconds)
+        captions = [text] + [""] * (len(files) - 1)
+        entity_groups = [list(entities or [])] + [[] for _ in range(len(files) - 1)]
+        await client.send_file(
+            target,
+            file=files,
+            caption=captions,
+            formatting_entities=entity_groups,
+            link_preview=False,
+            parse_mode=None,
         )
 
 
@@ -203,10 +239,10 @@ async def album_handler(event):
             log("拦截: 尾部处理后仍包含链接")
             return
 
-        await safe_send(
+        await safe_send_album(
             target=TARGET_ID,
+            files=[m.media for m in msgs],
             text=new_text,
-            media=[m.media for m in msgs],
             entities=new_entities
         )
 
@@ -254,7 +290,7 @@ async def handler(event):
             log("拦截: 尾部处理后仍包含链接")
             return
 
-        await safe_send(
+        await safe_send_single(
             target=TARGET_ID,
             text=new_text,
             media=msg.media,
