@@ -7,11 +7,10 @@ from datetime import datetime
 from collections import OrderedDict
 from dotenv import load_dotenv
 from aiohttp import web
-# Telethon核心导入
+# Telethon核心导入（移除有兼容问题的helpers导入）
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError
-from telethon.helpers import add_surrogate, remove_surrogate
 from telethon.tl.types import (
     # 全量富文本格式实体，1:1还原所有格式
     MessageEntityBold, MessageEntityItalic, MessageEntityUnderline,
@@ -22,6 +21,15 @@ from telethon.tl.types import (
     # 频道与权限类型
     Channel, ChatAdminRights
 )
+
+# -------------------------- 内置UTF-16代理对处理函数（彻底解决导入报错） --------------------------
+def add_surrogate(text: str) -> str:
+    """和Telethon原生逻辑完全一致，将字符串转为UTF-16代理对格式，对齐Telegram的offset计算"""
+    return text.encode("utf-16-le", "surrogatepass").decode("utf-16-le", "surrogatepass")
+
+def remove_surrogate(text: str) -> str:
+    """还原代理对格式的字符串为正常Python字符串"""
+    return text.encode("utf-16-le", "surrogatepass").decode("utf-16-le", "surrogatepass")
 
 # -------------------------- 全局常量配置 --------------------------
 # Telegram平台硬限制
@@ -50,7 +58,7 @@ ENV_CONFIG = {
     "HEALTH_CHECK_PORT": int(os.getenv("PORT", 8080))
 }
 
-# 【修复】核心环境变量前置校验，启动前就暴露问题
+# 核心环境变量前置校验，启动前就暴露问题
 def pre_check_env():
     required_fields = ["API_ID", "API_HASH", "SOURCE_CHANNELS", "TARGET_CHANNEL"]
     missing_fields = [field for field in required_fields if not ENV_CONFIG[field]]
@@ -84,7 +92,7 @@ HEALTH_CHECK_PORT = ENV_CONFIG["HEALTH_CHECK_PORT"]
 # -------------------------- 全局运行变量 --------------------------
 SOURCE_CHAT_IDS = []
 TARGET_CHAT_ID = None
-# 【修复】LRU消息去重缓存，替代简单set，避免全量清空导致重复转发
+# LRU消息去重缓存，替代简单set，避免全量清空导致重复转发
 PROCESSED_MESSAGE_IDS = OrderedDict()
 # 定时重启线程全局句柄，用于优雅关闭
 RESTART_TIMER = None
@@ -127,7 +135,7 @@ async def start_health_check_server():
 
 async def parse_channel_to_id(channel_input, is_target=False):
     """
-    【修复】万能频道解析，100%兼容所有输入格式，输出Telegram标准Chat ID
+    万能频道解析，100%兼容所有输入格式，输出Telegram标准Chat ID
     彻底解决ID匹配错误、解析失败的问题
     """
     try:
@@ -194,7 +202,7 @@ def is_valid_media(media):
 
 def process_text_and_entities(text, entities):
     """
-    【修复】1:1还原所有富文本格式，彻底解决多字节字符offset错位问题
+    1:1还原所有富文本格式，彻底解决多字节字符offset错位问题
     支持：加粗、斜体、下划线、删除线、引用框、代码块、链接等所有Telegram格式
     """
     if not text:
@@ -247,7 +255,7 @@ def has_blocked_content(text):
     return False, ""
 
 def add_processed_id(message_id):
-    """【修复】LRU消息去重，超过容量自动删除最旧的记录，避免重复转发"""
+    """LRU消息去重，超过容量自动删除最旧的记录，避免重复转发"""
     global PROCESSED_MESSAGE_IDS
     # 如果已存在，移动到末尾（最新）
     if message_id in PROCESSED_MESSAGE_IDS:
@@ -259,9 +267,9 @@ def add_processed_id(message_id):
     # 添加新记录
     PROCESSED_MESSAGE_IDS[message_id] = True
 
-# -------------------------- 保活&重启机制（修复版） --------------------------
+# -------------------------- 保活&重启机制 --------------------------
 async def connection_keep_alive():
-    """【修复】连接保活，全异常捕获，极端情况也不会导致事件循环崩溃"""
+    """连接保活，全异常捕获，极端情况也不会导致事件循环崩溃"""
     while True:
         await asyncio.sleep(180)
         try:
@@ -274,7 +282,7 @@ async def connection_keep_alive():
             await asyncio.sleep(5)
 
 def auto_restart_scheduler():
-    """【修复】定时重启，保存线程句柄，支持优雅关闭"""
+    """定时重启，保存线程句柄，支持优雅关闭"""
     global RESTART_TIMER
     print(f"[定时重启] 程序将在 {RESTART_INTERVAL_HOURS} 小时后自动重启")
     RESTART_TIMER = threading.Timer(
@@ -294,13 +302,13 @@ def graceful_shutdown():
 
 # -------------------------- 消息处理核心逻辑 --------------------------
 async def handle_single_message(event):
-    """【修复】单条消息处理，跳过相册消息，避免重复转发"""
+    """单条消息处理，跳过相册消息，避免重复转发"""
     now_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     chat_id = event.chat_id
     message = event.message
     message_id = message.id
 
-    # 【核心修复】相册消息有grouped_id，直接跳过，仅由Album事件处理，彻底解决重复转发
+    # 核心修复：相册消息有grouped_id，直接跳过，仅由Album事件处理，彻底解决重复转发
     if message.grouped_id is not None:
         return
 
@@ -358,7 +366,7 @@ async def handle_single_message(event):
             print(f"❌ 发送失败 | 原因: 媒体大小{media_size_mb:.2f}MB，超过Telegram最大限制{TG_MAX_MEDIA_SIZE_MB}MB")
             return
 
-    # 7. 无来源转发消息，【修复】自动处理限流重试
+    # 7. 无来源转发消息，自动处理限流重试
     try:
         await client.send_message(
             entity=TARGET_CHAT_ID,
@@ -391,7 +399,7 @@ async def handle_single_message(event):
         print(f"❌ 转发失败 | 消息ID {message_id} | 失败原因: {str(e)}")
 
 async def handle_album_message(event):
-    """【修复】相册/多媒体组处理，完整保留所有媒体和caption，1:1还原"""
+    """相册/多媒体组处理，完整保留所有媒体和caption，1:1还原"""
     now_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     chat_id = event.chat_id
     main_message = event.messages[0]
@@ -426,7 +434,7 @@ async def handle_album_message(event):
         print(f"🚫 相册拦截 | 原因: 相册内无有效图片/视频")
         return
 
-    # 【修复】合并相册内所有子媒体的caption，完整还原原内容
+    # 合并相册内所有子媒体的caption，完整还原原内容
     full_text = main_message.text
     for msg in event.messages[1:]:
         if msg.text and msg.text.strip():
@@ -453,7 +461,7 @@ async def handle_album_message(event):
         print(f"❌ 发送失败 | 原因: 处理后文本长度{len(processed_text)}，超过Telegram最大限制{TG_MAX_TEXT_LENGTH}")
         return
 
-    # 7. 无来源转发相册，【修复】自动处理限流重试
+    # 7. 无来源转发相册，自动处理限流重试
     try:
         await client.send_message(
             entity=TARGET_CHAT_ID,
@@ -492,7 +500,7 @@ async def main():
         # 1. 启动健康检查服务
         await start_health_check_server()
 
-        # 2. 登录Telegram客户端，【修复】无效Session兜底处理
+        # 2. 登录Telegram客户端，无效Session兜底处理
         try:
             await client.start()
             me = await client.get_me()
@@ -517,7 +525,7 @@ async def main():
             sys.exit(1)
         print(f"✅ 源频道解析完成，最终监听ID列表: {SOURCE_CHAT_IDS}")
 
-        # 4. 解析目标频道 + 【修复】管理员权限前置校验
+        # 4. 解析目标频道 + 管理员权限前置校验
         print("\n==================== 开始解析目标频道 ====================")
         TARGET_CHAT_ID, target_entity = await parse_channel_to_id(TARGET_CHANNEL_INPUT, is_target=True)
         # 校验账号在目标频道的管理员权限
@@ -536,7 +544,7 @@ async def main():
             print(f"💡 请确认你的账号是目标频道的管理员，且开启了发送消息/媒体权限")
             sys.exit(1)
 
-        # 5. 注册事件监听，【修复】先解析完所有频道再注册，100%生效
+        # 5. 注册事件监听，先解析完所有频道再注册，100%生效
         print("\n==================== 注册事件监听 ====================")
         client.add_event_handler(handle_single_message, events.NewMessage())
         client.add_event_handler(handle_album_message, events.Album())
