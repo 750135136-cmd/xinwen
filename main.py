@@ -6,6 +6,7 @@ from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError
 from telethon.tl.types import MessageEntityBold
 from telethon.extensions import html as tl_html
+
 # ========= 配置 =========
 API_ID = 25559912
 API_HASH = "22d3bb9665ad7e6a86e89c1445672e07"
@@ -14,46 +15,33 @@ SOURCE = "@as777"
 TARGET = "@hrxxw"
 RESTART_TIME = 72000  # 20小时
 TAIL_TEXT = "关注华人新闻: @hrxxw 投稿: @LimTGbot"
+
 client = TelegramClient(SESSION, API_ID, API_HASH)
 SOURCE_ENTITY = None
 TARGET_ENTITY = None
+
 # ========= 日志 =========
 def log(msg: str):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
+
 # ========= 基础判断 =========
 def has_link(text: str) -> bool:
     if not text:
         return False
     return bool(re.search(r"(https?://|www\.)", text, re.IGNORECASE))
+
 def has_paid_ad(text: str) -> bool:
     return bool(text and "付费广告" in text)
+
 def count_buttons(msg) -> int:
     if not getattr(msg, "buttons", None):
         return 0
     return sum(len(row) for row in msg.buttons)
 
-# ========= 【新增】emoji数量判断功能 =========
-# 全量emoji匹配正则，兼容主流Unicode表情、符号、国旗等
-EMOJI_PATTERN = re.compile(
-    r"[\U0001F600-\U0001F64F\U0001F300-\U0001F5FF\U0001F680-\U0001F6FF"
-    r"\U0001F1E0-\U0001F1FF\U00002702-\U000027B0\U000024C2-\U0001F251"
-    r"\U0001F900-\U0001F9FF\U0001FA70-\U0001FAFF\U00002600-\U000026FF"
-    r"\U00002B50-\U00002B59]",
-    flags=re.UNICODE
-)
-def count_emojis(text: str) -> int:
-    """统计文本中的emoji数量"""
-    if not text:
-        return 0
-    return len(EMOJI_PATTERN.findall(text))
-def has_excess_emojis(text: str, limit: int = 20) -> bool:
-    """判断文本中emoji是否达到/超过限制数量（默认8个）"""
-    return count_emojis(text) >= limit
-# ========= 【新增结束】 =========
-
 def pick_text_from_message(msg):
     txt = getattr(msg, "raw_text", None) or getattr(msg, "message", None) or ""
     return txt, getattr(msg, "entities", None)
+
 # ========= 【修复】相册文本&实体获取：完全兼容Telethon 1.42.0，正确保留所有格式实体 =========
 def pick_caption_from_album(event):
     # Telethon 1.42.0 相册标准行为：caption和对应格式实体固定在第一条消息中
@@ -75,6 +63,7 @@ def pick_caption_from_album(event):
     
     # 最终兜底：确保实体永远是列表，不会出现None，避免格式处理失效
     return txt, list(entities or [])
+
 # ========= 尾部处理：只改最后一段 =========
 def trim_tail_keep_entities(text: str, entities=None):
     if not text:
@@ -106,6 +95,7 @@ def trim_tail_keep_entities(text: str, entities=None):
             new_entities.append(ent2)
     new_entities.append(MessageEntityBold(offset=len(prefix) + 2, length=len(TAIL_TEXT)))
     return new_text, new_entities
+
 def to_html(text: str, entities):
     """
     把 text + entities 转成 HTML，
@@ -118,6 +108,7 @@ def to_html(text: str, entities):
     except Exception:
         # 兜底：至少保证不会因为格式转换崩掉
         return text
+
 # ========= 发送封装 =========
 async def safe_send_single(*, target, text_html, media):
     try:
@@ -142,6 +133,7 @@ async def safe_send_single(*, target, text_html, media):
             parse_mode="html",
             link_preview=False,
         )
+
 # ========= 【修复】相册发送：删除重复拼接caption的错误逻辑，保证长度和媒体数完全匹配 =========
 async def safe_send_album(*, target, files, captions_html):
     """
@@ -172,6 +164,7 @@ async def safe_send_album(*, target, files, captions_html):
             parse_mode="html",
             link_preview=False,
         )
+
 # ========= 单条处理 =========
 async def message_handler(event):
     try:
@@ -190,12 +183,6 @@ async def message_handler(event):
         if has_paid_ad(text):
             log("拦截: 含付费广告")
             return
-        # 【新增】emoji超量拦截逻辑
-        emoji_num = count_emojis(text)
-        if has_excess_emojis(text):
-            log(f"拦截: 含{emoji_num}个emoji表情，达到/超过限制8个")
-            return
-        # 【新增结束】
         if 1 <= btn_count <= 3:
             log(f"拦截: 按钮数量 {btn_count}（1~3 禁止）")
             return
@@ -212,6 +199,7 @@ async def message_handler(event):
         log("转发成功: 单条消息")
     except Exception as e:
         log(f"消息处理错误: {e}")
+
 # ========= 相册处理 =========
 async def album_handler(event):
     try:
@@ -227,12 +215,6 @@ async def album_handler(event):
         if has_paid_ad(text):
             log("拦截: 含付费广告")
             return
-        # 【新增】相册emoji超量拦截逻辑
-        emoji_num = count_emojis(text)
-        if has_excess_emojis(text):
-            log(f"拦截: 相册含{emoji_num}个emoji表情，达到/超过限制8个")
-            return
-        # 【新增结束】
         if 1 <= btn_count <= 3:
             log(f"拦截: 按钮数量 {btn_count}（1~3 禁止）")
             return
@@ -252,12 +234,14 @@ async def album_handler(event):
         log(f"转发成功: 相册 | 实际媒体数:{len(msgs)}")
     except Exception as e:
         log(f"相册处理错误: {e}")
+
 # ========= 20小时自动重启 =========
 async def auto_restart():
     await asyncio.sleep(RESTART_TIME)
     log("20小时到，执行自动重启")
     await client.disconnect()
     raise SystemExit(0)
+
 # ========= 启动前解析实体并绑定监听 =========
 async def resolve_and_bind():
     global SOURCE_ENTITY, TARGET_ENTITY
@@ -269,10 +253,12 @@ async def resolve_and_bind():
     log(f"目标频道: {getattr(TARGET_ENTITY, 'title', '')} | username: @{getattr(TARGET_ENTITY, 'username', None) or '无公开用户名'}")
     client.add_event_handler(album_handler, events.Album(chats=SOURCE_ENTITY))
     client.add_event_handler(message_handler, events.NewMessage(chats=SOURCE_ENTITY))
+
 # ========= 主程序 =========
 async def main():
     await client.start()
     await resolve_and_bind()
     asyncio.create_task(auto_restart())
     await client.run_until_disconnected()
+
 client.loop.run_until_complete(main())
