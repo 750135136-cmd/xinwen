@@ -2,154 +2,131 @@ import re
 import copy
 import asyncio
 from datetime import datetime
-
-from telethon import TelegramClient, events, utils
+from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError
 from telethon.tl.types import MessageEntityBold
-
+from telethon.extensions import html as tl_html
 # ========= 配置 =========
 API_ID = 25559912
 API_HASH = "22d3bb9665ad7e6a86e89c1445672e07"
-
 SESSION = "session"   # 根目录下的 session.session
-
-SOURCE = "@djrrw"     # 监听频道用户名 / 可解析频道
-TARGET = "@djrrv"     # 目标频道用户名 / 可解析频道
-
+SOURCE = "@as777"
+TARGET = "@hrxxw"
 RESTART_TIME = 72000  # 20小时
-
 TAIL_TEXT = "关注华人新闻: @hrxxw 投稿: @LimTGbot"
-
 client = TelegramClient(SESSION, API_ID, API_HASH)
-
-SOURCE_ID = None
-TARGET_ID = None
-
-
+SOURCE_ENTITY = None
+TARGET_ENTITY = None
 # ========= 日志 =========
 def log(msg: str):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
-
-
 # ========= 基础判断 =========
 def has_link(text: str) -> bool:
     if not text:
         return False
     return bool(re.search(r"(https?://|www\.)", text, re.IGNORECASE))
-
-
 def has_paid_ad(text: str) -> bool:
     return bool(text and "付费广告" in text)
-
-
 def count_buttons(msg) -> int:
     if not getattr(msg, "buttons", None):
         return 0
     return sum(len(row) for row in msg.buttons)
 
+# ========= 【新增】emoji数量判断功能 =========
+# 全量emoji匹配正则，兼容主流Unicode表情、符号、国旗等
+EMOJI_PATTERN = re.compile(
+    r"[\U0001F600-\U0001F64F\U0001F300-\U0001F5FF\U0001F680-\U0001F6FF"
+    r"\U0001F1E0-\U0001F1FF\U00002702-\U000027B0\U000024C2-\U0001F251"
+    r"\U0001F900-\U0001F9FF\U0001FA70-\U0001FAFF\U00002600-\U000026FF"
+    r"\U00002B50-\U00002B59]",
+    flags=re.UNICODE
+)
+def count_emojis(text: str) -> int:
+    """统计文本中的emoji数量"""
+    if not text:
+        return 0
+    return len(EMOJI_PATTERN.findall(text))
+def has_excess_emojis(text: str, limit: int = 20) -> bool:
+    """判断文本中emoji是否达到/超过限制数量（默认8个）"""
+    return count_emojis(text) >= limit
+# ========= 【新增结束】 =========
 
 def pick_text_from_message(msg):
     txt = getattr(msg, "raw_text", None) or getattr(msg, "message", None) or ""
     return txt, getattr(msg, "entities", None)
-
-
+# ========= 【修复】相册文本&实体获取：完全兼容Telethon 1.42.0，正确保留所有格式实体 =========
 def pick_caption_from_album(event):
-    """
-    相册正文提取：
-    1) event.text
-    2) event.messages 逐条找
-    3) original_update 兜底
-    """
-    txt = getattr(event, "text", None) or ""
-    if txt.strip():
-        return txt, None
-
-    for m in event.messages:
-        t = getattr(m, "raw_text", None) or getattr(m, "message", None) or ""
-        if t.strip():
-            return t, getattr(m, "entities", None)
-
-    try:
-        orig = getattr(event, "original_update", None)
-        if orig and getattr(orig, "message", None):
-            msg = orig.message
-            t = getattr(msg, "message", None) or ""
+    # Telethon 1.42.0 相册标准行为：caption和对应格式实体固定在第一条消息中
+    if not event.messages:
+        return "", []
+    main_msg = event.messages[0]
+    # 优先从主消息获取文本和实体，和单条消息逻辑完全对齐
+    txt = getattr(main_msg, "raw_text", None) or getattr(main_msg, "message", None) or ""
+    entities = getattr(main_msg, "entities", None) or []
+    
+    # 兜底兼容：主消息无文本时，遍历所有消息找有效文本和对应实体
+    if not txt.strip():
+        for m in event.messages[1:]:
+            t = getattr(m, "raw_text", None) or getattr(m, "message", None) or ""
             if t.strip():
-                return t, getattr(msg, "entities", None)
-    except Exception:
-        pass
-
-    return "", None
-
-
+                txt = t
+                entities = getattr(m, "entities", None) or []
+                break
+    
+    # 最终兜底：确保实体永远是列表，不会出现None，避免格式处理失效
+    return txt, list(entities or [])
 # ========= 尾部处理：只改最后一段 =========
 def trim_tail_keep_entities(text: str, entities=None):
-    """
-    规则：
-    - 只检查最后一个空行后面的尾部块
-    - 如果尾部块含 @ 或链接，则删除整段尾部块
-    - 替换成固定文案
-    - 前面的引用框/加粗等实体尽量保留
-    """
     if not text:
         return text, []
-
     raw = text.rstrip()
     entities = list(entities or [])
-
     matches = list(re.finditer(r"\n\s*\n", raw))
     if not matches:
         return raw, entities
-
     last_sep = matches[-1]
     prefix = raw[:last_sep.start()].rstrip()
     tail = raw[last_sep.end():].strip()
-
     if not tail or ("@" not in tail and not has_link(tail)):
         return raw, entities
-
     new_text = prefix + "\n\n" + TAIL_TEXT
     prefix_len = len(prefix)
-
     new_entities = []
     for ent in entities:
         start = ent.offset
         end = ent.offset + ent.length
-
-        # 完全在前半段：保留
         if end <= prefix_len:
             new_entities.append(copy.copy(ent))
             continue
-
-        # 完全在尾部：删除
         if start >= prefix_len:
             continue
-
-        # 跨越边界：截断
         ent2 = copy.copy(ent)
         ent2.length = max(0, prefix_len - start)
         if ent2.length > 0:
             new_entities.append(ent2)
-
-    # 给替换后的尾部加粗
     new_entities.append(MessageEntityBold(offset=len(prefix) + 2, length=len(TAIL_TEXT)))
-
     return new_text, new_entities
-
-
+def to_html(text: str, entities):
+    """
+    把 text + entities 转成 HTML，
+    这样发送时不会退回成 * 号，也更稳地保留引用框/加粗。
+    """
+    if not text:
+        return ""
+    try:
+        return tl_html.unparse(text, entities or [])
+    except Exception:
+        # 兜底：至少保证不会因为格式转换崩掉
+        return text
 # ========= 发送封装 =========
-async def safe_send_single(*, target, text, media, entities=None):
-    """
-    单张图片/视频：caption + formatting_entities 直接发送
-    """
+async def safe_send_single(*, target, text_html, media):
     try:
         await client.send_file(
             target,
             file=media,
-            caption=text,
-            formatting_entities=entities,
+            caption=text_html,
+            parse_mode="html",
             link_preview=False,
-            parse_mode=None,
         )
     except FloodWaitError as e:
         log(f"触发 FloodWait：需要等待 {e.seconds} 秒")
@@ -161,31 +138,24 @@ async def safe_send_single(*, target, text, media, entities=None):
         await client.send_file(
             target,
             file=media,
-            caption=text,
-            formatting_entities=entities,
+            caption=text_html,
+            parse_mode="html",
             link_preview=False,
-            parse_mode=None,
         )
-
-
-async def safe_send_album(*, target, files, text, entities=None):
+# ========= 【修复】相册发送：删除重复拼接caption的错误逻辑，保证长度和媒体数完全匹配 =========
+async def safe_send_album(*, target, files, captions_html):
     """
     相册/多媒体组：
-    Telethon 要求 caption 可为 list[str]，
-    formatting_entities 要为 list[list[MessageEntity...]]，
-    每个内层列表和对应文件一一匹配。
+    每个文件都使用 HTML 格式的 caption（确保每个文件单独传递 HTML 格式）。
     """
     try:
-        captions = [text] + [""] * (len(files) - 1)
-        entity_groups = [list(entities or [])] + [[] for _ in range(len(files) - 1)]
-
+        # 修复：直接使用传入的captions_html，已保证长度和files完全一致，无需重复拼接
         await client.send_file(
             target,
             file=files,
-            caption=captions,
-            formatting_entities=entity_groups,
+            caption=captions_html,
+            parse_mode="html",
             link_preview=False,
-            parse_mode=None,
         )
     except FloodWaitError as e:
         log(f"触发 FloodWait：需要等待 {e.seconds} 秒")
@@ -194,146 +164,115 @@ async def safe_send_album(*, target, files, text, entities=None):
             await client.disconnect()
             raise SystemExit(1)
         await asyncio.sleep(e.seconds)
-        captions = [text] + [""] * (len(files) - 1)
-        entity_groups = [list(entities or [])] + [[] for _ in range(len(files) - 1)]
+        # 重试时也直接使用原captions_html，保证长度匹配
         await client.send_file(
             target,
             file=files,
-            caption=captions,
-            formatting_entities=entity_groups,
+            caption=captions_html,
+            parse_mode="html",
             link_preview=False,
-            parse_mode=None,
         )
-
-
-# ========= 相册处理 =========
-@client.on(events.Album())
-async def album_handler(event):
-    try:
-        if SOURCE_ID is not None and event.chat_id != SOURCE_ID:
-            return
-
-        msgs = event.messages
-        first = msgs[0]
-        btn_count = count_buttons(first)
-
-        text, entities = pick_caption_from_album(event)
-
-        log(f"收到相册 | chat_id:{event.chat_id} | 媒体数:{len(msgs)} | 文本长度:{len(text)} | 按钮:{btn_count}")
-
-        if not text.strip():
-            log("拦截: 相册无文字")
-            return
-
-        if has_paid_ad(text):
-            log("拦截: 含付费广告")
-            return
-
-        if 1 <= btn_count <= 3:
-            log(f"拦截: 按钮数量 {btn_count}（1~3 禁止）")
-            return
-
-        new_text, new_entities = trim_tail_keep_entities(text, entities)
-
-        if has_link(new_text):
-            log("拦截: 尾部处理后仍包含链接")
-            return
-
-        await safe_send_album(
-            target=TARGET_ID,
-            files=[m.media for m in msgs],
-            text=new_text,
-            entities=new_entities
-        )
-
-        log(f"转发成功: 相册 | 实际媒体数:{len(msgs)}")
-
-    except Exception as e:
-        log(f"相册处理错误: {e}")
-
-
 # ========= 单条处理 =========
-@client.on(events.NewMessage(incoming=True))
-async def handler(event):
+async def message_handler(event):
     try:
         if event.grouped_id:
             return
-
-        if SOURCE_ID is not None and event.chat_id != SOURCE_ID:
-            return
-
         msg = event.message
         text, entities = pick_text_from_message(msg)
         btn_count = count_buttons(msg)
-
-        log(f"收到消息 | chat_id:{event.chat_id} | 文本长度:{len(text)} | 按钮:{btn_count} | 有媒体:{bool(msg.media)}")
-
+        log(f"收到消息 | 文本长度:{len(text)} | 按钮:{btn_count} | 有媒体:{bool(msg.media)}")
         if not msg.media:
             log("拦截: 无媒体")
             return
-
         if not text.strip():
             log("拦截: 无文字")
             return
-
         if has_paid_ad(text):
             log("拦截: 含付费广告")
             return
-
+        # 【新增】emoji超量拦截逻辑
+        emoji_num = count_emojis(text)
+        if has_excess_emojis(text):
+            log(f"拦截: 含{emoji_num}个emoji表情，达到/超过限制8个")
+            return
+        # 【新增结束】
         if 1 <= btn_count <= 3:
             log(f"拦截: 按钮数量 {btn_count}（1~3 禁止）")
             return
-
         new_text, new_entities = trim_tail_keep_entities(text, entities)
-
         if has_link(new_text):
             log("拦截: 尾部处理后仍包含链接")
             return
-
+        text_html = to_html(new_text, new_entities)
         await safe_send_single(
-            target=TARGET_ID,
-            text=new_text,
-            media=msg.media,
-            entities=new_entities
+            target=TARGET_ENTITY,
+            text_html=text_html,
+            media=msg.media
         )
-
         log("转发成功: 单条消息")
-
     except Exception as e:
         log(f"消息处理错误: {e}")
-
-
+# ========= 相册处理 =========
+async def album_handler(event):
+    try:
+        msgs = event.messages
+        first = msgs[0]
+        btn_count = count_buttons(first)
+        # 修复后：正确获取相册文本和完整格式实体，和单条消息处理逻辑完全对齐
+        text, entities = pick_caption_from_album(event)
+        log(f"收到相册 | 媒体数:{len(msgs)} | 文本长度:{len(text)} | 按钮:{btn_count}")
+        if not text.strip():
+            log("拦截: 相册无文字")
+            return
+        if has_paid_ad(text):
+            log("拦截: 含付费广告")
+            return
+        # 【新增】相册emoji超量拦截逻辑
+        emoji_num = count_emojis(text)
+        if has_excess_emojis(text):
+            log(f"拦截: 相册含{emoji_num}个emoji表情，达到/超过限制8个")
+            return
+        # 【新增结束】
+        if 1 <= btn_count <= 3:
+            log(f"拦截: 按钮数量 {btn_count}（1~3 禁止）")
+            return
+        # 完全复用单条消息的尾部处理&格式转换逻辑，保证一致性
+        new_text, new_entities = trim_tail_keep_entities(text, entities)
+        if has_link(new_text):
+            log("拦截: 尾部处理后仍包含链接")
+            return
+        # 转换为 HTML 格式，完整保留加粗、引用框等所有格式
+        first_caption_html = to_html(new_text, new_entities)
+        captions_html = [first_caption_html] + [""] * (len(msgs) - 1)
+        await safe_send_album(
+            target=TARGET_ENTITY,
+            files=[m.media for m in msgs],
+            captions_html=captions_html
+        )
+        log(f"转发成功: 相册 | 实际媒体数:{len(msgs)}")
+    except Exception as e:
+        log(f"相册处理错误: {e}")
 # ========= 20小时自动重启 =========
 async def auto_restart():
     await asyncio.sleep(RESTART_TIME)
     log("20小时到，执行自动重启")
     await client.disconnect()
     raise SystemExit(0)
-
-
-# ========= 启动前解析实体 =========
-async def resolve_entities():
-    global SOURCE_ID, TARGET_ID
-
-    source_entity = await client.get_entity(SOURCE)
-    target_entity = await client.get_entity(TARGET)
-
-    SOURCE_ID = utils.get_peer_id(source_entity)
-    TARGET_ID = utils.get_peer_id(target_entity)
-
+# ========= 启动前解析实体并绑定监听 =========
+async def resolve_and_bind():
+    global SOURCE_ENTITY, TARGET_ENTITY
+    SOURCE_ENTITY = await client.get_entity(SOURCE)
+    TARGET_ENTITY = await client.get_entity(TARGET)
     me = await client.get_me()
-
     log(f"启动成功 | 登录账号: {me.username or me.id}")
-    log(f"监听频道: {getattr(source_entity, 'title', '')} | username: @{getattr(source_entity, 'username', None) or '无公开用户名'} | id: {SOURCE_ID}")
-    log(f"目标频道: {getattr(target_entity, 'title', '')} | username: @{getattr(target_entity, 'username', None) or '无公开用户名'} | id: {TARGET_ID}")
-
-
+    log(f"监听频道: {getattr(SOURCE_ENTITY, 'title', '')} | username: @{getattr(SOURCE_ENTITY, 'username', None) or '无公开用户名'}")
+    log(f"目标频道: {getattr(TARGET_ENTITY, 'title', '')} | username: @{getattr(TARGET_ENTITY, 'username', None) or '无公开用户名'}")
+    client.add_event_handler(album_handler, events.Album(chats=SOURCE_ENTITY))
+    client.add_event_handler(message_handler, events.NewMessage(chats=SOURCE_ENTITY))
 # ========= 主程序 =========
 async def main():
     await client.start()
-    await resolve_entities()
+    await resolve_and_bind()
     asyncio.create_task(auto_restart())
     await client.run_until_disconnected()
-
-
 client.loop.run_until_complete(main())
