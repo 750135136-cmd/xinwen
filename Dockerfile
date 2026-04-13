@@ -1,10 +1,9 @@
 # 官方Python基础镜像，兼容Railway环境
 FROM python:3.11-slim
 
-# 安装系统依赖：ffmpeg(视频处理)、OpenCV依赖、OCR运行库
+# 安装系统依赖：仅保留视频处理必备的ffmpeg和基础运行库，移除所有废弃/冗余包
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
-    libgl1-mesa-glx \
     libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
