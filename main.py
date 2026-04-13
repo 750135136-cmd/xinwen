@@ -1,34 +1,20 @@
 import re
 import copy
 import asyncio
-import io
-import cv2
-import numpy as np
 from datetime import datetime
-from PIL import Image
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError
 from telethon.tl.types import MessageEntityBold
 from telethon.extensions import html as tl_html
-# 新增：免费离线OCR库
-import easyocr
 
 # ========= 配置 =========
 API_ID = 25559912
 API_HASH = "22d3bb9665ad7e6a86e89c1445672e07"
 SESSION = "session"   # 根目录下的 session.session
-SOURCE = "@ll111"
+SOURCE = "@as777"
 TARGET = "@hrxxw"
 RESTART_TIME = 72000  # 20小时
 TAIL_TEXT = "关注华人新闻: @hrxxw 投稿: @LimTGbot"
-
-# ========= 新增：OCR识别配置（免费离线，无API调用成本） =========
-# 全局仅初始化1次OCR模型，避免重复加载占用内存/CPU
-OCR_READER = easyocr.Reader(['en'], gpu=False, verbose=False)
-# 识别目标关键词（大小写不敏感）
-TARGET_KEYWORD = "LL111"
-# 视频固定抽帧数量
-VIDEO_SAMPLE_COUNT = 10
 
 client = TelegramClient(SESSION, API_ID, API_HASH)
 SOURCE_ENTITY = None
@@ -37,123 +23,6 @@ TARGET_ENTITY = None
 # ========= 日志 =========
 def log(msg: str):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
-
-# ========= 新增：OCR识别核心函数 =========
-def ocr_image_has_keyword(image_data: bytes) -> bool:
-    """
-    单张图片OCR识别，判断是否包含目标关键词
-    :param image_data: 图片字节流
-    :return: True=命中关键词，False=未命中
-    """
-    try:
-        # 字节流转为OCR兼容的图片格式
-        image = Image.open(io.BytesIO(image_data)).convert('RGB')
-        image_np = np.array(image)
-        # 识别文本（仅返回文本内容，关闭详情提升速度）
-        result_texts = OCR_READER.readtext(image_np, detail=0, paragraph=True)
-        # 合并文本并转为大写，实现大小写不敏感匹配
-        full_text = " ".join(result_texts).upper()
-        return TARGET_KEYWORD.upper() in full_text
-    except Exception as e:
-        log(f"OCR图片识别异常: {e}")
-        # 异常时默认未命中，避免误拦截正常消息
-        return False
-
-async def media_ocr_check(media) -> tuple[bool, str]:
-    """
-    检查Telegram媒体（图片/视频）是否包含目标关键词
-    :param media: Telethon的MessageMedia对象
-    :return: (是否命中, 媒体类型)
-    """
-    # 识别媒体类型
-    media_type = "未知媒体"
-    is_image = False
-    is_video = False
-
-    # 兼容Telethon各类媒体封装格式
-    if hasattr(media, 'photo') and media.photo:
-        media_type = "图片"
-        is_image = True
-    elif hasattr(media, 'document') and media.document:
-        mime_type = getattr(media.document, 'mime_type', '')
-        if mime_type.startswith('video/'):
-            media_type = "视频"
-            is_video = True
-        elif mime_type.startswith('image/'):
-            media_type = "图片"
-            is_image = True
-
-    # 非图片/视频媒体直接放行，不拦截
-    if not is_image and not is_video:
-        return False, media_type
-
-    try:
-        # 下载媒体到内存（不写磁盘，适配Railway无状态环境）
-        media_bytes = await client.download_media(media, file=io.BytesIO())
-        media_bytes.seek(0)
-        media_data = media_bytes.read()
-
-        # 图片识别逻辑
-        if is_image:
-            is_hit = ocr_image_has_keyword(media_data)
-            return is_hit, media_type
-
-        # 视频识别逻辑：先识别封面，再10次均匀抽帧，命中即停止
-        if is_video:
-            import tempfile
-            # 临时文件处理视频（OpenCV不支持直接读取内存视频流）
-            with tempfile.NamedTemporaryFile(suffix='.mp4', delete=True) as temp_video:
-                temp_video.write(media_data)
-                temp_video.flush()
-
-                # 打开视频文件
-                cap = cv2.VideoCapture(temp_video.name)
-                if not cap.isOpened():
-                    log(f"视频打开失败，跳过识别")
-                    return False, media_type
-
-                # 第一步：识别视频封面（第0帧），命中直接返回
-                ret, cover_frame = cap.read()
-                if ret:
-                    is_success, buffer = cv2.imencode(".jpg", cover_frame)
-                    if is_success and ocr_image_has_keyword(buffer.tobytes()):
-                        cap.release()
-                        return True, media_type
-
-                # 第二步：均匀抽取10帧识别，命中即停止
-                total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                if total_frames <= 0:
-                    cap.release()
-                    return False, media_type
-
-                # 计算抽帧间隔，避免重复/无效抽帧
-                sample_interval = max(total_frames // VIDEO_SAMPLE_COUNT, 1)
-                hit_result = False
-
-                for i in range(VIDEO_SAMPLE_COUNT):
-                    frame_num = min((i + 1) * sample_interval, total_frames - 1)
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
-                    ret, frame = cap.read()
-                    if not ret:
-                        continue
-
-                    # 识别当前帧
-                    is_success, buffer = cv2.imencode(".jpg", frame)
-                    if not is_success:
-                        continue
-
-                    if ocr_image_has_keyword(buffer.tobytes()):
-                        hit_result = True
-                        break
-
-                # 释放视频资源
-                cap.release()
-                return hit_result, media_type
-
-    except Exception as e:
-        log(f"媒体OCR检查异常: {e}")
-        # 异常时默认放行，避免误拦截
-        return False, media_type
 
 # ========= 基础判断 =========
 def has_link(text: str) -> bool:
@@ -321,15 +190,6 @@ async def message_handler(event):
         if has_link(new_text):
             log("拦截: 尾部处理后仍包含链接")
             return
-        
-        # ========= 新增：媒体OCR关键词拦截检查 =========
-        is_hit, media_type = await media_ocr_check(msg.media)
-        if is_hit:
-            log(f"拦截: {media_type}命中关键词{TARGET_KEYWORD}，不发送")
-            return
-        log(f"{media_type}未命中关键词{TARGET_KEYWORD}，继续转发流程")
-        # ========= 新增结束 =========
-
         text_html = to_html(new_text, new_entities)
         await safe_send_single(
             target=TARGET_ENTITY,
@@ -363,17 +223,6 @@ async def album_handler(event):
         if has_link(new_text):
             log("拦截: 尾部处理后仍包含链接")
             return
-        
-        # ========= 新增：相册全媒体OCR关键词拦截检查 =========
-        all_media = [m.media for m in msgs]
-        for idx, media in enumerate(all_media):
-            is_hit, media_type = await media_ocr_check(media)
-            if is_hit:
-                log(f"拦截: 相册第{idx+1}个{media_type}命中关键词{TARGET_KEYWORD}，整个相册不发送")
-                return
-        log(f"相册所有媒体未命中关键词{TARGET_KEYWORD}，继续转发流程")
-        # ========= 新增结束 =========
-
         # 转换为 HTML 格式，完整保留加粗、引用框等所有格式
         first_caption_html = to_html(new_text, new_entities)
         captions_html = [first_caption_html] + [""] * (len(msgs) - 1)

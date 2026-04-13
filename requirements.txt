@@ -1,7 +1,1 @@
 telethon==1.42.0
-# 免费离线OCR识别依赖
-easyocr==1.7.2
-# 服务器专用无GUI版OpenCV，无需图形库依赖，完美适配Railway
-opencv-python-headless==4.10.0.84
-Pillow==10.4.0
-numpy==1.26.4
