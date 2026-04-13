@@ -1,20 +1,32 @@
 import re
 import copy
 import asyncio
+import os
+import cv2
+import numpy as np
 from datetime import datetime
+from aip import AipOcr  # 需安装 baidu-aip
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError
-from telethon.tl.types import MessageEntityBold
+from telethon.tl.types import MessageEntityBold, MessageService
 from telethon.extensions import html as tl_html
 
 # ========= 配置 =========
 API_ID = 25559912
 API_HASH = "22d3bb9665ad7e6a86e89c1445672e07"
-SESSION = "session"   # 根目录下的 session.session
-SOURCE = "@as777"
+SESSION = "session"
+SOURCE = "@ll111"
 TARGET = "@hrxxw"
-RESTART_TIME = 72000  # 20小时
+RESTART_TIME = 72000 
 TAIL_TEXT = "关注华人新闻: @hrxxw 投稿: @LimTGbot"
+
+# ========= 百度 OCR 配置 (请替换为你的真实信息) =========
+BAIDU_APP_ID = '122761270'
+BAIDU_API_KEY = 'kVCUjj7y81g5WRit6dt8CozM'
+BAIDU_SECRET_KEY = 'ZQ8dY4p2cj4ktwQcg7aHwQmkFzItK8eQ'
+KEYWORD = "LL111"
+
+ocr_client = AipOcr(BAIDU_APP_ID, BAIDU_API_KEY, BAIDU_SECRET_KEY)
 
 client = TelegramClient(SESSION, API_ID, API_HASH)
 SOURCE_ENTITY = None
@@ -24,7 +36,79 @@ TARGET_ENTITY = None
 def log(msg: str):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
 
-# ========= 基础判断 =========
+# ========= OCR 逻辑 =========
+def perform_ocr(image_bytes):
+    """调用百度OCR识别文字，并增加错误捕获"""
+    try:
+        options = {"language_type": "CHN_ENG"}
+        result = ocr_client.basicGeneral(image_bytes, options)
+        
+        # 如果有识别结果
+        if "words_result" in result:
+            text = "".join([w["words"] for w in result["words_result"]])
+            return text
+        
+        # 如果返回了错误码（比如次数用完）
+        if "error_code" in result:
+            log(f"⚠️ OCR 接口报错: {result.get('error_msg')} (错误码: {result.get('error_code')})")
+            # 次数用完的错误码通常是 17 (Open api daily request limit reached)
+            # 或者 18 (Open api qps limit reached)
+            
+    except Exception as e:
+        log(f"❌ OCR 请求发生物理异常: {e}")
+    return ""
+
+
+async def ocr_check_media(msg) -> bool:
+    """
+    检查媒体文件中是否包含关键字
+    返回 True 表示命中关键字（拦截），False 表示未命中（通过）
+    """
+    if not msg or not msg.media:
+        return False
+
+    temp_path = await msg.download_media(file="temp_media")
+    hit = False
+    
+    try:
+        # 处理图片
+        if msg.photo or (msg.document and "image" in (msg.document.mime_type or "")):
+            with open(temp_path, 'rb') as f:
+                img_data = f.read()
+                detected_text = perform_ocr(img_data)
+                if KEYWORD in detected_text:
+                    hit = True
+
+        # 处理视频
+        elif msg.video or (msg.document and "video" in (msg.document.mime_type or "")):
+            cap = cv2.VideoCapture(temp_path)
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            if total_frames > 0:
+                # 抽帧10次
+                for i in range(10):
+                    frame_idx = int((total_frames / 11) * (i + 1))
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                    success, frame = cap.read()
+                    if success:
+                        # 转换帧为图片字节
+                        _, buffer = cv2.imencode('.jpg', frame)
+                        detected_text = perform_ocr(buffer.tobytes())
+                        if KEYWORD in detected_text:
+                            hit = True
+                            break
+            cap.release()
+
+    except Exception as e:
+        log(f"媒体解析错误: {e}")
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+    
+    result_str = "命中关键词" if hit else "未命中"
+    log(f"识图结果: {result_str}")
+    return hit
+
+# ========= 基础判断 (保持不变) =========
 def has_link(text: str) -> bool:
     if not text:
         return False
@@ -42,17 +126,12 @@ def pick_text_from_message(msg):
     txt = getattr(msg, "raw_text", None) or getattr(msg, "message", None) or ""
     return txt, getattr(msg, "entities", None)
 
-# ========= 【修复】相册文本&实体获取：完全兼容Telethon 1.42.0，正确保留所有格式实体 =========
 def pick_caption_from_album(event):
-    # Telethon 1.42.0 相册标准行为：caption和对应格式实体固定在第一条消息中
     if not event.messages:
         return "", []
     main_msg = event.messages[0]
-    # 优先从主消息获取文本和实体，和单条消息逻辑完全对齐
     txt = getattr(main_msg, "raw_text", None) or getattr(main_msg, "message", None) or ""
     entities = getattr(main_msg, "entities", None) or []
-    
-    # 兜底兼容：主消息无文本时，遍历所有消息找有效文本和对应实体
     if not txt.strip():
         for m in event.messages[1:]:
             t = getattr(m, "raw_text", None) or getattr(m, "message", None) or ""
@@ -60,11 +139,8 @@ def pick_caption_from_album(event):
                 txt = t
                 entities = getattr(m, "entities", None) or []
                 break
-    
-    # 最终兜底：确保实体永远是列表，不会出现None，避免格式处理失效
     return txt, list(entities or [])
 
-# ========= 尾部处理：只改最后一段 =========
 def trim_tail_keep_entities(text: str, entities=None):
     if not text:
         return text, []
@@ -97,19 +173,14 @@ def trim_tail_keep_entities(text: str, entities=None):
     return new_text, new_entities
 
 def to_html(text: str, entities):
-    """
-    把 text + entities 转成 HTML，
-    这样发送时不会退回成 * 号，也更稳地保留引用框/加粗。
-    """
     if not text:
         return ""
     try:
         return tl_html.unparse(text, entities or [])
     except Exception:
-        # 兜底：至少保证不会因为格式转换崩掉
         return text
 
-# ========= 发送封装 =========
+# ========= 发送封装 (保持不变) =========
 async def safe_send_single(*, target, text_html, media):
     try:
         await client.send_file(
@@ -134,14 +205,8 @@ async def safe_send_single(*, target, text_html, media):
             link_preview=False,
         )
 
-# ========= 【修复】相册发送：删除重复拼接caption的错误逻辑，保证长度和媒体数完全匹配 =========
 async def safe_send_album(*, target, files, captions_html):
-    """
-    相册/多媒体组：
-    每个文件都使用 HTML 格式的 caption（确保每个文件单独传递 HTML 格式）。
-    """
     try:
-        # 修复：直接使用传入的captions_html，已保证长度和files完全一致，无需重复拼接
         await client.send_file(
             target,
             file=files,
@@ -156,7 +221,6 @@ async def safe_send_album(*, target, files, captions_html):
             await client.disconnect()
             raise SystemExit(1)
         await asyncio.sleep(e.seconds)
-        # 重试时也直接使用原captions_html，保证长度匹配
         await client.send_file(
             target,
             file=files,
@@ -165,7 +229,7 @@ async def safe_send_album(*, target, files, captions_html):
             link_preview=False,
         )
 
-# ========= 单条处理 =========
+# ========= 单条处理 (集成 OCR) =========
 async def message_handler(event):
     try:
         if event.grouped_id:
@@ -174,9 +238,16 @@ async def message_handler(event):
         text, entities = pick_text_from_message(msg)
         btn_count = count_buttons(msg)
         log(f"收到消息 | 文本长度:{len(text)} | 按钮:{btn_count} | 有媒体:{bool(msg.media)}")
+        
         if not msg.media:
             log("拦截: 无媒体")
             return
+
+        # --- OCR 检查 ---
+        if await ocr_check_media(msg):
+            log("拦截: 媒体识图命中关键词")
+            return
+        
         if not text.strip():
             log("拦截: 无文字")
             return
@@ -200,15 +271,22 @@ async def message_handler(event):
     except Exception as e:
         log(f"消息处理错误: {e}")
 
-# ========= 相册处理 =========
+# ========= 相册处理 (集成 OCR) =========
 async def album_handler(event):
     try:
         msgs = event.messages
         first = msgs[0]
         btn_count = count_buttons(first)
-        # 修复后：正确获取相册文本和完整格式实体，和单条消息处理逻辑完全对齐
         text, entities = pick_caption_from_album(event)
         log(f"收到相册 | 媒体数:{len(msgs)} | 文本长度:{len(text)} | 按钮:{btn_count}")
+
+        # --- OCR 检查 (遍历相册内所有媒体) ---
+        for i, m in enumerate(msgs):
+            log(f"正在识别相册第 {i+1} 个媒体...")
+            if await ocr_check_media(m):
+                log(f"拦截: 相册第 {i+1} 个媒体识图命中关键词")
+                return
+
         if not text.strip():
             log("拦截: 相册无文字")
             return
@@ -218,12 +296,10 @@ async def album_handler(event):
         if 1 <= btn_count <= 3:
             log(f"拦截: 按钮数量 {btn_count}（1~3 禁止）")
             return
-        # 完全复用单条消息的尾部处理&格式转换逻辑，保证一致性
         new_text, new_entities = trim_tail_keep_entities(text, entities)
         if has_link(new_text):
             log("拦截: 尾部处理后仍包含链接")
             return
-        # 转换为 HTML 格式，完整保留加粗、引用框等所有格式
         first_caption_html = to_html(new_text, new_entities)
         captions_html = [first_caption_html] + [""] * (len(msgs) - 1)
         await safe_send_album(
@@ -235,26 +311,22 @@ async def album_handler(event):
     except Exception as e:
         log(f"相册处理错误: {e}")
 
-# ========= 20小时自动重启 =========
+# ========= 启动及主程序 (保持不变) =========
 async def auto_restart():
     await asyncio.sleep(RESTART_TIME)
     log("20小时到，执行自动重启")
     await client.disconnect()
     raise SystemExit(0)
 
-# ========= 启动前解析实体并绑定监听 =========
 async def resolve_and_bind():
     global SOURCE_ENTITY, TARGET_ENTITY
     SOURCE_ENTITY = await client.get_entity(SOURCE)
     TARGET_ENTITY = await client.get_entity(TARGET)
     me = await client.get_me()
     log(f"启动成功 | 登录账号: {me.username or me.id}")
-    log(f"监听频道: {getattr(SOURCE_ENTITY, 'title', '')} | username: @{getattr(SOURCE_ENTITY, 'username', None) or '无公开用户名'}")
-    log(f"目标频道: {getattr(TARGET_ENTITY, 'title', '')} | username: @{getattr(TARGET_ENTITY, 'username', None) or '无公开用户名'}")
     client.add_event_handler(album_handler, events.Album(chats=SOURCE_ENTITY))
     client.add_event_handler(message_handler, events.NewMessage(chats=SOURCE_ENTITY))
 
-# ========= 主程序 =========
 async def main():
     await client.start()
     await resolve_and_bind()
