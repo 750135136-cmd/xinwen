@@ -1,6 +1,5 @@
 telethon==1.42.0
-baidu-aip
-opencv-python-headless
-numpy
-chardet
-requests
+easyocr==1.7.2
+opencv-python==4.10.0.84
+Pillow==10.4.0
+numpy==1.26.4
