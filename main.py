@@ -28,7 +28,10 @@ def log(msg: str):
 def has_link(text: str) -> bool:
     if not text:
         return False
-    return bool(re.search(r"((https?://|(?!@hrxxw|@LimTGbot)@|www\.|http|t\.me)", text, re.IGNORECASE))
+    # 修复：括号闭合 + 修正负向预查逻辑 + 优化正则匹配，避免误匹配和语法错误
+    pattern = r"(http|t\.me|@(?!hrxxw\b|LimTGbot\b)\w+)"
+    return bool(re.search(pattern, text, re.IGNORECASE))
+
 
 def has_paid_ad(text: str) -> bool:
     return bool(text and "付费广告" in text)
