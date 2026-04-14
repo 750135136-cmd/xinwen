@@ -11,7 +11,7 @@ from telethon.extensions import html as tl_html
 API_ID = 25559912
 API_HASH = "22d3bb9665ad7e6a86e89c1445672e07"
 SESSION = "session"   # 根目录下的 session.session
-SOURCE = "@as777"
+SOURCE = "@n4000"
 TARGET = "@hrxxw"
 RESTART_TIME = 72000  # 20小时
 TAIL_TEXT = "关注华人新闻: @hrxxw 投稿: @LimTGbot"
@@ -28,7 +28,7 @@ def log(msg: str):
 def has_link(text: str) -> bool:
     if not text:
         return False
-    return bool(re.search(r"(https?://|www\.)", text, re.IGNORECASE))
+    return bool(re.search(r"((https?://|(?!@hrxxw|@LimTGbot)@|www\.|http|t\.me)", text, re.IGNORECASE))
 
 def has_paid_ad(text: str) -> bool:
     return bool(text and "付费广告" in text)
