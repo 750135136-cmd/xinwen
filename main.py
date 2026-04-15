@@ -40,29 +40,34 @@ def count_buttons(msg) -> int:
     return sum(len(row) for row in msg.buttons)
 
 def pick_text_from_message(msg):
-    txt = getattr(msg, "raw_text", None) or getattr(msg, "message", None) or ""
+    txt = getattr(msg, "message", None) or getattr(msg, "raw_text", None) or ""
     return txt, getattr(msg, "entities", None)
 
-# ========= 【修复】相册文本&实体获取：完全兼容Telethon 1.42.0，正确保留所有格式实体 =========
+
+# ========= 【修复】相册文本&实体获取：强制按ID排序，彻底解决3图caption丢失问题 =========
 def pick_caption_from_album(event):
-    # Telethon 1.42.0 相册标准行为：caption和对应格式实体固定在第一条消息中
     if not event.messages:
         return "", []
-    main_msg = event.messages[0]
-    # 优先从主消息获取文本和实体，和单条消息逻辑完全对齐
-    txt = getattr(main_msg, "raw_text", None) or getattr(main_msg, "message", None) or ""
+    
+    # 核心修复：强制按消息ID升序排序，确保第一条是服务端认定的组内首条（唯一保留caption）
+    sorted_msgs = sorted(event.messages, key=lambda m: m.id)
+    # 取ID最小的首条消息，Telegram仅保留这条的caption
+    main_msg = sorted_msgs[0]
+    
+    # 优化：优先取官方标准的message属性，兜底raw_text，兼容所有Telethon版本
+    txt = getattr(main_msg, "message", None) or getattr(main_msg, "raw_text", None) or ""
     entities = getattr(main_msg, "entities", None) or []
     
-    # 兜底兼容：主消息无文本时，遍历所有消息找有效文本和对应实体
+    # 兜底兼容：全量遍历所有排序后的消息，找有效文本（极端场景兜底）
     if not txt.strip():
-        for m in event.messages[1:]:
-            t = getattr(m, "raw_text", None) or getattr(m, "message", None) or ""
+        for m in sorted_msgs[1:]:
+            t = getattr(m, "message", None) or getattr(m, "raw_text", None) or ""
             if t.strip():
                 txt = t
                 entities = getattr(m, "entities", None) or []
                 break
     
-    # 最终兜底：确保实体永远是列表，不会出现None，避免格式处理失效
+    # 最终兜底：确保实体永远是列表，不会出现None
     return txt, list(entities or [])
 
 # ========= 尾部处理：只改最后一段 =========
@@ -205,9 +210,9 @@ async def message_handler(event):
 async def album_handler(event):
     try:
         msgs = event.messages
-        first = msgs[0]
+        sorted_msgs = sorted(msgs, key=lambda m: m.id)
+        first = sorted_msgs[0]
         btn_count = count_buttons(first)
-        # 修复后：正确获取相册文本和完整格式实体，和单条消息处理逻辑完全对齐
         text, entities = pick_caption_from_album(event)
         log(f"收到相册 | 媒体数:{len(msgs)} | 文本长度:{len(text)} | 按钮:{btn_count}")
         if not text.strip():
