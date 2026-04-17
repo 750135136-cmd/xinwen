@@ -246,7 +246,7 @@ async def auto_restart():
     await asyncio.sleep(RESTART_TIME)
     log("20小时到，执行自动重启")
     await client.disconnect()
-    raise SystemExit(0)
+    raise SystemExit(1)
 
 # ========= 启动前解析实体并绑定监听 =========
 async def resolve_and_bind():
@@ -264,7 +264,9 @@ async def resolve_and_bind():
 async def main():
     await client.start()
     await resolve_and_bind()
-    asyncio.create_task(auto_restart())
+    # 修复：持有任务引用，避免asyncio任务异常警告，确保重启逻辑稳定
+    restart_task = asyncio.create_task(auto_restart())
     await client.run_until_disconnected()
+    await restart_task
 
 client.loop.run_until_complete(main())
