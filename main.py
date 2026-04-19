@@ -28,7 +28,7 @@ def log(msg: str):
 def has_link(text: str) -> bool:
     if not text:
         return False
-    return bool(re.search(r"(http|t\.me|@(?!hrxxw\b|LimTGbot\b)\w+)", text, re.IGNORECASE))
+    return bool(re.search(r"(http|t\.me)", text, re.IGNORECASE))
 
 
 def has_paid_ad(text: str) -> bool:
