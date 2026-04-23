@@ -33,11 +33,23 @@ def has_link(text: str) -> bool:
 
 def has_paid_ad(text: str) -> bool:
     return bool(text and "付费广告" in text)
+    
+# ========= 新增：判断是否是其他地方转发来的消息 =========
+def is_forwarded_msg(msg) -> bool:
+    # 只要fwd_from不为空，就是转发消息，兼容所有转发场景
+    return bool(getattr(msg, "fwd_from", None))
 
 def count_buttons(msg) -> int:
-    if not getattr(msg, "buttons", None):
+    if not msg:
         return 0
-    return sum(len(row) for row in msg.buttons)
+    # 优先解析原生按钮数据，解决事件中buttons属性未加载导致的计数为0
+    reply_markup = getattr(msg, "reply_markup", None)
+    if reply_markup and hasattr(reply_markup, "rows"):
+        return sum(len(row.buttons) for row in reply_markup.rows)
+    # 兜底兼容原逻辑
+    if getattr(msg, "buttons", None):
+        return sum(len(row) for row in msg.buttons)
+    return 0
 
 def pick_text_from_message(msg):
     txt = getattr(msg, "message", None) or getattr(msg, "raw_text", None) or ""
@@ -151,7 +163,7 @@ async def safe_send_album(*, target, files, captions_html):
         await client.send_file(
             target,
             file=files,
-            caption=captions_html,
+            caption=captions_html[0],
             parse_mode="html",
             link_preview=False,
         )
@@ -166,7 +178,7 @@ async def safe_send_album(*, target, files, captions_html):
         await client.send_file(
             target,
             file=files,
-            caption=captions_html,
+            caption=captions_html[0],
             parse_mode="html",
             link_preview=False,
         )
@@ -177,6 +189,11 @@ async def message_handler(event):
         if event.grouped_id:
             return
         msg = event.message
+        # ========= 新增：转发消息拦截 =========
+        if is_forwarded_msg(msg):
+            log("拦截: 其他地方转发的单条消息")
+            return
+        # ========= 以下是你原有的所有代码，完全不用动 =========
         text, entities = pick_text_from_message(msg)
         btn_count = count_buttons(msg)
         log(f"收到消息 | 文本长度:{len(text)} | 按钮:{btn_count} | 有媒体:{bool(msg.media)}")
@@ -212,7 +229,12 @@ async def album_handler(event):
         msgs = event.messages
         sorted_msgs = sorted(msgs, key=lambda m: m.id)
         first = sorted_msgs[0]
-        btn_count = count_buttons(first)
+        # ========= 新增：转发相册拦截（相册里任意一条是转发的，就拦截） =========
+        if any(is_forwarded_msg(m) for m in msgs):
+            log("拦截: 其他地方转发的相册消息")
+            return
+        # ========= 以下是你原有的所有代码，完全不用动 =========
+        btn_count = sum(count_buttons(m) for m in event.messages)
         text, entities = pick_caption_from_album(event)
         log(f"收到相册 | 媒体数:{len(msgs)} | 文本长度:{len(text)} | 按钮:{btn_count}")
         if not text.strip():
@@ -234,19 +256,33 @@ async def album_handler(event):
         captions_html = [first_caption_html] + [""] * (len(msgs) - 1)
         await safe_send_album(
             target=TARGET_ENTITY,
-            files=[m.media for m in msgs],
+            files=[m.media for m in msgs if m.media],
             captions_html=captions_html
         )
         log(f"转发成功: 相册 | 实际媒体数:{len(msgs)}")
     except Exception as e:
         log(f"相册处理错误: {e}")
 
-# ========= 20小时自动重启 =========
+# 【！！！就把你给的edit_handler代码，完整粘贴到这里！！！】
+# ========= 编辑事件拦截：仅处理违规按钮，不改变原有发送逻辑 =========
+async def edit_handler(event):
+    try:
+        msg = event.message
+        btn_count = count_buttons(msg)
+        text, _ = pick_text_from_message(msg)
+        # 命中拦截规则直接打日志，不改动原有转发逻辑
+        if 1 <= btn_count <= 3 or has_paid_ad(text):
+            log(f"编辑后触发拦截 | 消息ID:{msg.id} | 按钮数:{btn_count}")
+    except Exception as e:
+        log(f"编辑事件处理错误: {e}")
+
+# ========= 20小时自动重启 =========（你原有的代码，完全不用动）
 async def auto_restart():
     await asyncio.sleep(RESTART_TIME)
     log("20小时到，执行自动重启")
     await client.disconnect()
     raise SystemExit(1)
+
 
 # ========= 启动前解析实体并绑定监听 =========
 async def resolve_and_bind():
@@ -257,8 +293,11 @@ async def resolve_and_bind():
     log(f"启动成功 | 登录账号: {me.username or me.id}")
     log(f"监听频道: {getattr(SOURCE_ENTITY, 'title', '')} | username: @{getattr(SOURCE_ENTITY, 'username', None) or '无公开用户名'}")
     log(f"目标频道: {getattr(TARGET_ENTITY, 'title', '')} | username: @{getattr(TARGET_ENTITY, 'username', None) or '无公开用户名'}")
+    # 下面3行修正缩进，和上面的log行完全对齐，删掉多余的空格
     client.add_event_handler(album_handler, events.Album(chats=SOURCE_ENTITY))
     client.add_event_handler(message_handler, events.NewMessage(chats=SOURCE_ENTITY))
+    # 新增：编辑事件拦截，仅处理违规按钮，不改变原有发送逻辑
+    client.add_event_handler(edit_handler, events.MessageEdited(chats=SOURCE_ENTITY))
 
 # ========= 主程序 =========
 async def main():
