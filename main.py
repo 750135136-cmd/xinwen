@@ -11,42 +11,127 @@ from telethon.extensions import html as tl_html
 API_ID = 25559912
 API_HASH = "22d3bb9665ad7e6a86e89c1445672e07"
 SESSION = "session"   # 根目录下的 session.session
-SOURCE = "@gegong0000"
-TARGET = "@hrxxw"
 RESTART_TIME = 72000  # 20小时
 TAIL_TEXT = "关注华人新闻: @hrxxw 投稿: @LimTGbot"
 
+# ========= 新增：回复联动&配置文件核心参数 =========
+# 找不到原消息映射时，是否仍转发为普通消息（False=不转发，True=转发）
+ALLOW_REPLY_WITHOUT_MAPPING = True
+# 配置文件路径（和main.py同目录，Railway直接放根目录即可）
+CHANNEL_CONFIG_FILE = "channel_config.txt"
+# 消息ID持久化文件（自动生成，重启不丢失历史映射）
+MESSAGE_MAPPING_FILE = "message_mapping.txt"
+
 client = TelegramClient(SESSION, API_ID, API_HASH)
-SOURCE_ENTITY = None
-TARGET_ENTITY = None
+# ========= 新增：全局缓存变量（兼容原有单频道+新增多频道） =========
+CHANNEL_MAP = {}
+SOURCE_ENTITY_CACHE = {}
+MESSAGE_ID_MAP = {}
+FILE_LOCK = asyncio.Lock()  # 异步文件锁，防止多线程写文件冲突
 
 # ========= 日志 =========
 def log(msg: str):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
 
-# ========= 基础判断 =========
+# ========= 新增：配置文件&消息映射持久化核心函数 =========
+def load_channel_config() -> dict:
+    """加载频道配置文件，兼容你原有单频道配置"""
+    config_map = {}
+    try:
+        with open(CHANNEL_CONFIG_FILE, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = [p.strip() for p in line.split("|")]
+            if len(parts) != 2:
+                log(f"配置文件格式错误，跳过该行: {line}")
+                continue
+            source, target = parts
+            config_map[source] = target
+        log(f"频道配置加载完成，共加载 {len(config_map)} 组频道映射")
+        return config_map
+    except FileNotFoundError:
+        # 找不到配置文件，默认使用你原来的单频道配置，兜底兼容
+        log(f"未找到 {CHANNEL_CONFIG_FILE}，默认使用原有单频道配置")
+        return {"@gegong0000": "@hrxxw"}
+    except Exception as e:
+        log(f"配置文件加载失败: {e}")
+        raise SystemExit(1)
+
+async def load_message_mapping():
+    """启动时加载历史消息ID映射，重启不丢失"""
+    global MESSAGE_ID_MAP
+    try:
+        async with FILE_LOCK:
+            with open(MESSAGE_MAPPING_FILE, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            for line in lines:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split("|")
+                if len(parts) != 4:
+                    continue
+                source_channel_id, source_msg_id, target_channel_id, target_msg_id = parts
+                map_key = f"{source_channel_id}|{source_msg_id}"
+                MESSAGE_ID_MAP[map_key] = f"{target_channel_id}|{target_msg_id}"
+        log(f"消息映射加载完成，共加载 {len(MESSAGE_ID_MAP)} 条历史消息映射")
+    except FileNotFoundError:
+        # 文件不存在自动创建，无需手动操作
+        with open(MESSAGE_MAPPING_FILE, "w", encoding="utf-8") as f:
+            f.write("# 消息ID映射持久化文件，请勿手动修改 | 格式：监听频道ID|监听消息ID|目标频道ID|目标消息ID\n")
+        log(f"未找到消息映射文件，已自动创建 {MESSAGE_MAPPING_FILE}")
+    except Exception as e:
+        log(f"消息映射加载失败: {e}")
+
+async def save_message_mapping(source_channel_id: int, source_msg_id: int, target_channel_id: int, target_msg_id: int):
+    """保存消息ID映射，同时更新内存和持久化文件"""
+    map_key = f"{source_channel_id}|{source_msg_id}"
+    map_value = f"{target_channel_id}|{target_msg_id}"
+    MESSAGE_ID_MAP[map_key] = map_value
+    try:
+        async with FILE_LOCK:
+            with open(MESSAGE_MAPPING_FILE, "a", encoding="utf-8") as f:
+                f.write(f"{source_channel_id}|{source_msg_id}|{target_channel_id}|{target_msg_id}\n")
+    except Exception as e:
+        log(f"消息映射持久化失败: {e}")
+
+# ========= 新增：回复目标ID获取核心函数 =========
+def get_reply_target_id(source_channel_id: int, msg) -> int | None:
+    """根据原消息的回复信息，获取目标频道对应的回复消息ID，兼容1.42.0"""
+    if not hasattr(msg, "reply_to") or not msg.reply_to:
+        return None
+    reply_to_msg_id = getattr(msg.reply_to, "reply_to_msg_id", None)
+    if not reply_to_msg_id:
+        return None
+    map_key = f"{source_channel_id}|{reply_to_msg_id}"
+    target_map_value = MESSAGE_ID_MAP.get(map_key)
+    if not target_map_value:
+        return None
+    _, target_msg_id = target_map_value.split("|")
+    return int(target_msg_id)
+
+# ========= 基础判断（你原有代码，完全未改动） =========
 def has_link(text: str) -> bool:
     if not text:
         return False
     return bool(re.search(r"(http|t\.me)", text, re.IGNORECASE))
 
-
 def has_paid_ad(text: str) -> bool:
     return bool(text and "付费广告" in text)
-    
-# ========= 新增：判断是否是其他地方转发来的消息 =========
+
+# ========= 新增：判断是否是其他地方转发来的消息（你原有代码，完全未改动） =========
 def is_forwarded_msg(msg) -> bool:
-    # 只要fwd_from不为空，就是转发消息，兼容所有转发场景
     return bool(getattr(msg, "fwd_from", None))
 
 def count_buttons(msg) -> int:
     if not msg:
         return 0
-    # 优先解析原生按钮数据，解决事件中buttons属性未加载导致的计数为0
     reply_markup = getattr(msg, "reply_markup", None)
     if reply_markup and hasattr(reply_markup, "rows"):
         return sum(len(row.buttons) for row in reply_markup.rows)
-    # 兜底兼容原逻辑
     if getattr(msg, "buttons", None):
         return sum(len(row) for row in msg.buttons)
     return 0
@@ -55,22 +140,17 @@ def pick_text_from_message(msg):
     txt = getattr(msg, "message", None) or getattr(msg, "raw_text", None) or ""
     return txt, getattr(msg, "entities", None)
 
-
-# ========= 【修复】相册文本&实体获取：强制按ID排序，彻底解决3图caption丢失问题 =========
+# ========= 【修复】相册文本&实体获取（你原有代码，完全未改动） =========
 def pick_caption_from_album(event):
     if not event.messages:
         return "", []
     
-    # 核心修复：强制按消息ID升序排序，确保第一条是服务端认定的组内首条（唯一保留caption）
     sorted_msgs = sorted(event.messages, key=lambda m: m.id)
-    # 取ID最小的首条消息，Telegram仅保留这条的caption
     main_msg = sorted_msgs[0]
     
-    # 优化：优先取官方标准的message属性，兜底raw_text，兼容所有Telethon版本
     txt = getattr(main_msg, "message", None) or getattr(main_msg, "raw_text", None) or ""
     entities = getattr(main_msg, "entities", None) or []
     
-    # 兜底兼容：全量遍历所有排序后的消息，找有效文本（极端场景兜底）
     if not txt.strip():
         for m in sorted_msgs[1:]:
             t = getattr(m, "message", None) or getattr(m, "raw_text", None) or ""
@@ -79,10 +159,9 @@ def pick_caption_from_album(event):
                 entities = getattr(m, "entities", None) or []
                 break
     
-    # 最终兜底：确保实体永远是列表，不会出现None
     return txt, list(entities or [])
 
-# ========= 尾部处理：只改最后一段 =========
+# ========= 尾部处理（你原有代码，完全未改动） =========
 def trim_tail_keep_entities(text: str, entities=None):
     if not text:
         return text, []
@@ -115,20 +194,15 @@ def trim_tail_keep_entities(text: str, entities=None):
     return new_text, new_entities
 
 def to_html(text: str, entities):
-    """
-    把 text + entities 转成 HTML，
-    这样发送时不会退回成 * 号，也更稳地保留引用框/加粗。
-    """
     if not text:
         return ""
     try:
         return tl_html.unparse(text, entities or [])
     except Exception:
-        # 兜底：至少保证不会因为格式转换崩掉
         return text
 
-# ========= 发送封装 =========
-async def safe_send_single(*, target, text_html, media):
+# ========= 发送封装（新增reply_to参数+返回值，原有防限流逻辑完全未改动） =========
+async def safe_send_single(*, target, text_html, media, reply_to=None):
     try:
         await client.send_file(
             target,
@@ -136,6 +210,7 @@ async def safe_send_single(*, target, text_html, media):
             caption=text_html,
             parse_mode="html",
             link_preview=False,
+            reply_to=reply_to
         )
     except FloodWaitError as e:
         log(f"触发 FloodWait：需要等待 {e.seconds} 秒")
@@ -150,22 +225,21 @@ async def safe_send_single(*, target, text_html, media):
             caption=text_html,
             parse_mode="html",
             link_preview=False,
+            reply_to=reply_to
         )
+    # 新增：返回发送成功的消息对象，用于记录映射
+    return await client.get_messages(target, limit=1)
 
-# ========= 【修复】相册发送：删除重复拼接caption的错误逻辑，保证长度和媒体数完全匹配 =========
-async def safe_send_album(*, target, files, captions_html):
-    """
-    相册/多媒体组：
-    每个文件都使用 HTML 格式的 caption（确保每个文件单独传递 HTML 格式）。
-    """
+# ========= 【修复】相册发送（新增reply_to参数+返回值，原有逻辑完全未改动） =========
+async def safe_send_album(*, target, files, captions_html, reply_to=None):
     try:
-        # 修复：直接使用传入的captions_html，已保证长度和files完全一致，无需重复拼接
         await client.send_file(
             target,
             file=files,
             caption=captions_html[0],
             parse_mode="html",
             link_preview=False,
+            reply_to=reply_to
         )
     except FloodWaitError as e:
         log(f"触发 FloodWait：需要等待 {e.seconds} 秒")
@@ -174,26 +248,34 @@ async def safe_send_album(*, target, files, captions_html):
             await client.disconnect()
             raise SystemExit(1)
         await asyncio.sleep(e.seconds)
-        # 重试时也直接使用原captions_html，保证长度匹配
         await client.send_file(
             target,
             file=files,
             caption=captions_html[0],
             parse_mode="html",
             link_preview=False,
+            reply_to=reply_to
         )
+    # 新增：返回发送成功的相册首条消息对象，用于记录映射
+    return await client.get_messages(target, limit=1)
 
-# ========= 单条处理 =========
+# ========= 单条处理（原有拦截逻辑完全未改动，新增回复联动+映射保存） =========
 async def message_handler(event):
     try:
         if event.grouped_id:
             return
         msg = event.message
-        # ========= 新增：转发消息拦截 =========
+        # 新增：适配多频道，获取当前频道对应的目标频道
+        source_channel_id = event.chat_id
+        target_entity = CHANNEL_MAP.get(source_channel_id)
+        if not target_entity:
+            log(f"拦截: 未找到该频道的目标映射 | 频道ID: {source_channel_id}")
+            return
+
+        # ========= 以下是你原有的所有拦截代码，完全未改动 =========
         if is_forwarded_msg(msg):
             log("拦截: 其他地方转发的单条消息")
             return
-        # ========= 以下是你原有的所有代码，完全不用动 =========
         text, entities = pick_text_from_message(msg)
         btn_count = count_buttons(msg)
         log(f"收到消息 | 文本长度:{len(text)} | 按钮:{btn_count} | 有媒体:{bool(msg.media)}")
@@ -214,26 +296,54 @@ async def message_handler(event):
             log("拦截: 尾部处理后仍包含链接")
             return
         text_html = to_html(new_text, new_entities)
-        await safe_send_single(
-            target=TARGET_ENTITY,
+        # ========= 原有代码结束，新增回复联动+发送+映射保存 =========
+
+        # 新增：获取回复目标消息ID
+        reply_to_target_id = get_reply_target_id(source_channel_id, msg)
+        # 新增：回复消息找不到原映射时，按配置处理
+        if msg.reply_to and not reply_to_target_id and not ALLOW_REPLY_WITHOUT_MAPPING:
+            log(f"拦截: 回复消息未找到原消息映射 | 消息ID: {msg.id} | 回复的原消息ID: {msg.reply_to.reply_to_msg_id}")
+            return
+
+        # 发送消息，兼容原有逻辑
+        sent_msg = await safe_send_single(
+            target=target_entity,
             text_html=text_html,
-            media=msg.media
+            media=msg.media,
+            reply_to=reply_to_target_id
         )
-        log("转发成功: 单条消息")
+
+        # 新增：保存消息ID映射，重启不丢失
+        if sent_msg:
+            sent_msg = sent_msg[0]
+            await save_message_mapping(
+                source_channel_id=source_channel_id,
+                source_msg_id=msg.id,
+                target_channel_id=target_entity.id,
+                target_msg_id=sent_msg.id
+            )
+            log(f"转发成功: 单条消息 | 原消息ID: {msg.id} | 目标消息ID: {sent_msg.id}" + (f" | 回复目标ID: {reply_to_target_id}" if reply_to_target_id else ""))
+
     except Exception as e:
         log(f"消息处理错误: {e}")
 
-# ========= 相册处理 =========
+# ========= 相册处理（原有逻辑完全未改动，新增回复联动+映射保存） =========
 async def album_handler(event):
     try:
         msgs = event.messages
         sorted_msgs = sorted(msgs, key=lambda m: m.id)
         first = sorted_msgs[0]
-        # ========= 新增：转发相册拦截（相册里任意一条是转发的，就拦截） =========
+        # 新增：适配多频道，获取当前频道对应的目标频道
+        source_channel_id = event.chat_id
+        target_entity = CHANNEL_MAP.get(source_channel_id)
+        if not target_entity:
+            log(f"拦截: 未找到该频道的目标映射 | 频道ID: {source_channel_id}")
+            return
+
+        # ========= 以下是你原有的所有拦截代码，完全未改动 =========
         if any(is_forwarded_msg(m) for m in msgs):
             log("拦截: 其他地方转发的相册消息")
             return
-        # ========= 以下是你原有的所有代码，完全不用动 =========
         btn_count = sum(count_buttons(m) for m in event.messages)
         text, entities = pick_caption_from_album(event)
         log(f"收到相册 | 媒体数:{len(msgs)} | 文本长度:{len(text)} | 按钮:{btn_count}")
@@ -246,64 +356,100 @@ async def album_handler(event):
         if 1 <= btn_count <= 3:
             log(f"拦截: 按钮数量 {btn_count}（1~3 禁止）")
             return
-        # 完全复用单条消息的尾部处理&格式转换逻辑，保证一致性
         new_text, new_entities = trim_tail_keep_entities(text, entities)
         if has_link(new_text):
             log("拦截: 尾部处理后仍包含链接")
             return
-        # 转换为 HTML 格式，完整保留加粗、引用框等所有格式
         first_caption_html = to_html(new_text, new_entities)
         captions_html = [first_caption_html] + [""] * (len(msgs) - 1)
-        await safe_send_album(
-            target=TARGET_ENTITY,
+        # ========= 原有代码结束，新增回复联动+发送+映射保存 =========
+
+        # 新增：获取回复目标消息ID
+        reply_to_target_id = get_reply_target_id(source_channel_id, first)
+        # 新增：回复相册找不到原映射时，按配置处理
+        if first.reply_to and not reply_to_target_id and not ALLOW_REPLY_WITHOUT_MAPPING:
+            log(f"拦截: 回复相册未找到原消息映射 | 首条消息ID: {first.id} | 回复的原消息ID: {first.reply_to.reply_to_msg_id}")
+            return
+
+        # 发送相册，兼容原有逻辑
+        sent_msg = await safe_send_album(
+            target=target_entity,
             files=[m.media for m in msgs if m.media],
-            captions_html=captions_html
+            captions_html=captions_html,
+            reply_to=reply_to_target_id
         )
-        log(f"转发成功: 相册 | 实际媒体数:{len(msgs)}")
+
+        # 新增：保存消息ID映射，重启不丢失
+        if sent_msg:
+            sent_msg = sent_msg[0]
+            await save_message_mapping(
+                source_channel_id=source_channel_id,
+                source_msg_id=first.id,
+                target_channel_id=target_entity.id,
+                target_msg_id=sent_msg.id
+            )
+            log(f"转发成功: 相册 | 原首条消息ID: {first.id} | 目标消息ID: {sent_msg.id}" + (f" | 回复目标ID: {reply_to_target_id}" if reply_to_target_id else ""))
+
     except Exception as e:
         log(f"相册处理错误: {e}")
 
-# 【！！！就把你给的edit_handler代码，完整粘贴到这里！！！】
-# ========= 编辑事件拦截：仅处理违规按钮，不改变原有发送逻辑 =========
+# ========= 编辑事件拦截（你原有代码，完全未改动，仅适配多频道） =========
 async def edit_handler(event):
     try:
         msg = event.message
+        source_channel_id = event.chat_id
         btn_count = count_buttons(msg)
         text, _ = pick_text_from_message(msg)
-        # 命中拦截规则直接打日志，不改动原有转发逻辑
         if 1 <= btn_count <= 3 or has_paid_ad(text):
-            log(f"编辑后触发拦截 | 消息ID:{msg.id} | 按钮数:{btn_count}")
+            log(f"编辑后触发拦截 | 频道ID:{source_channel_id} | 消息ID:{msg.id} | 按钮数:{btn_count}")
     except Exception as e:
         log(f"编辑事件处理错误: {e}")
 
-# ========= 20小时自动重启 =========（你原有的代码，完全不用动）
+# ========= 20小时自动重启（你原有代码，完全未改动） =========
 async def auto_restart():
     await asyncio.sleep(RESTART_TIME)
     log("20小时到，执行自动重启")
     await client.disconnect()
     raise SystemExit(1)
 
-
-# ========= 启动前解析实体并绑定监听 =========
+# ========= 启动前解析实体并绑定监听（适配txt配置+多频道） =========
 async def resolve_and_bind():
-    global SOURCE_ENTITY, TARGET_ENTITY
-    SOURCE_ENTITY = await client.get_entity(SOURCE)
-    TARGET_ENTITY = await client.get_entity(TARGET)
+    global CHANNEL_MAP, SOURCE_ENTITY_CACHE
+    # 加载频道配置
+    config_map = load_channel_config()
+    # 解析所有频道
+    temp_channel_map = {}
+    temp_source_cache = {}
+    for source_str, target_str in config_map.items():
+        try:
+            source_entity = await client.get_entity(source_str)
+            target_entity = await client.get_entity(target_str)
+            temp_channel_map[source_entity.id] = target_entity
+            temp_source_cache[source_entity.id] = source_entity
+            log(f"频道解析成功 | 监听频道: {source_entity.title} (ID:{source_entity.id}) | 目标频道: {target_entity.title} (ID:{target_entity.id})")
+        except Exception as e:
+            log(f"频道解析失败 | 监听标识: {source_str} | 目标标识: {target_str} | 错误: {e}")
+            raise SystemExit(1)
+    CHANNEL_MAP = temp_channel_map
+    SOURCE_ENTITY_CACHE = temp_source_cache
+
+    # 登录信息打印
     me = await client.get_me()
     log(f"启动成功 | 登录账号: {me.username or me.id}")
-    log(f"监听频道: {getattr(SOURCE_ENTITY, 'title', '')} | username: @{getattr(SOURCE_ENTITY, 'username', None) or '无公开用户名'}")
-    log(f"目标频道: {getattr(TARGET_ENTITY, 'title', '')} | username: @{getattr(TARGET_ENTITY, 'username', None) or '无公开用户名'}")
-    # 下面3行修正缩进，和上面的log行完全对齐，删掉多余的空格
-    client.add_event_handler(album_handler, events.Album(chats=SOURCE_ENTITY))
-    client.add_event_handler(message_handler, events.NewMessage(chats=SOURCE_ENTITY))
-    # 新增：编辑事件拦截，仅处理违规按钮，不改变原有发送逻辑
-    client.add_event_handler(edit_handler, events.MessageEdited(chats=SOURCE_ENTITY))
+    log(f"共监听 {len(CHANNEL_MAP)} 个频道，全部绑定完成")
 
-# ========= 主程序 =========
+    # 绑定事件，兼容原有逻辑
+    source_chats = list(SOURCE_ENTITY_CACHE.values())
+    client.add_event_handler(album_handler, events.Album(chats=source_chats))
+    client.add_event_handler(message_handler, events.NewMessage(chats=source_chats))
+    client.add_event_handler(edit_handler, events.MessageEdited(chats=source_chats))
+
+# ========= 主程序（新增消息映射加载，原有逻辑完全未改动） =========
 async def main():
     await client.start()
+    # 新增：启动时加载历史消息映射
+    await load_message_mapping()
     await resolve_and_bind()
-    # 修复：持有任务引用，避免asyncio任务异常警告，确保重启逻辑稳定
     restart_task = asyncio.create_task(auto_restart())
     await client.run_until_disconnected()
     await restart_task
