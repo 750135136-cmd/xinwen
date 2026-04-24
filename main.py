@@ -140,26 +140,37 @@ def pick_text_from_message(msg):
     txt = getattr(msg, "message", None) or getattr(msg, "raw_text", None) or ""
     return txt, getattr(msg, "entities", None)
 
-# ========= 【修复】相册文本&实体获取（你原有代码，完全未改动） =========
+# ========= 【修复】相册文本&实体获取（还原你原有核心逻辑，优化兜底，增加排查日志） =========
 def pick_caption_from_album(event):
     if not event.messages:
+        log("相册事件异常：无任何媒体消息")
         return "", []
     
+    # 核心逻辑和你原来完全一致：强制按消息ID升序排序，Telegram仅在ID最小的首条保留caption
     sorted_msgs = sorted(event.messages, key=lambda m: m.id)
     main_msg = sorted_msgs[0]
     
-    txt = getattr(main_msg, "message", None) or getattr(main_msg, "raw_text", None) or ""
+    # 优先取官方标准message属性，多层兜底，确保不会拿空
+    txt = getattr(main_msg, "message", None) or getattr(main_msg, "text", None) or getattr(main_msg, "raw_text", None) or ""
     entities = getattr(main_msg, "entities", None) or []
     
+    # 打印排查日志，确认首条消息的文本内容
+    log(f"相册首条消息ID:{main_msg.id} | 提取到的文本长度:{len(txt)} | 文本内容:{txt[:100]}")
+    
+    # 兜底兼容：全量遍历所有消息，找有效文本（极端场景兜底，和你原有逻辑一致）
     if not txt.strip():
+        log("相册首条无文本，开始遍历其他消息兜底")
         for m in sorted_msgs[1:]:
-            t = getattr(m, "message", None) or getattr(m, "raw_text", None) or ""
+            t = getattr(m, "message", None) or getattr(m, "text", None) or getattr(m, "raw_text", None) or ""
             if t.strip():
                 txt = t
                 entities = getattr(m, "entities", None) or []
+                log(f"相册兜底取到文本，消息ID:{m.id} | 文本长度:{len(txt)}")
                 break
     
+    # 最终兜底：确保实体永远是列表，不会出现None
     return txt, list(entities or [])
+
 
 # ========= 尾部处理（你原有代码，完全未改动） =========
 def trim_tail_keep_entities(text: str, entities=None):
@@ -327,12 +338,10 @@ async def message_handler(event):
     except Exception as e:
         log(f"消息处理错误: {e}")
 
-# ========= 相册处理（原有逻辑完全未改动，新增回复联动+映射保存） =========
+# ========= 相册处理（还原原有执行流程，去掉重复排序，保留回复联动功能） =========
 async def album_handler(event):
     try:
         msgs = event.messages
-        sorted_msgs = sorted(msgs, key=lambda m: m.id)
-        first = sorted_msgs[0]
         # 新增：适配多频道，获取当前频道对应的目标频道
         source_channel_id = event.chat_id
         target_entity = CHANNEL_MAP.get(source_channel_id)
@@ -340,13 +349,17 @@ async def album_handler(event):
             log(f"拦截: 未找到该频道的目标映射 | 频道ID: {source_channel_id}")
             return
 
-        # ========= 以下是你原有的所有拦截代码，完全未改动 =========
+        # ========= 以下是你原有的所有拦截代码，完全还原，无任何改动 =========
+        # 转发相册拦截
         if any(is_forwarded_msg(m) for m in msgs):
             log("拦截: 其他地方转发的相册消息")
             return
-        btn_count = sum(count_buttons(m) for m in event.messages)
+        # 按钮计数
+        btn_count = sum(count_buttons(m) for m in msgs)
+        # 提取相册文本&实体（和你原有逻辑完全一致，不再重复排序）
         text, entities = pick_caption_from_album(event)
-        log(f"收到相册 | 媒体数:{len(msgs)} | 文本长度:{len(text)} | 按钮:{btn_count}")
+        log(f"收到相册 | 媒体数:{len(msgs)} | 最终提取文本长度:{len(text)} | 按钮:{btn_count}")
+        # 原有拦截规则
         if not text.strip():
             log("拦截: 相册无文字")
             return
@@ -356,22 +369,25 @@ async def album_handler(event):
         if 1 <= btn_count <= 3:
             log(f"拦截: 按钮数量 {btn_count}（1~3 禁止）")
             return
+        # 尾部处理&格式转换，和你原有逻辑完全一致
         new_text, new_entities = trim_tail_keep_entities(text, entities)
         if has_link(new_text):
             log("拦截: 尾部处理后仍包含链接")
             return
         first_caption_html = to_html(new_text, new_entities)
         captions_html = [first_caption_html] + [""] * (len(msgs) - 1)
-        # ========= 原有代码结束，新增回复联动+发送+映射保存 =========
+        # ========= 原有逻辑结束，保留新增的回复联动功能 =========
 
-        # 新增：获取回复目标消息ID
+        # 获取回复目标消息ID
+        sorted_msgs = sorted(msgs, key=lambda m: m.id)
+        first = sorted_msgs[0]
         reply_to_target_id = get_reply_target_id(source_channel_id, first)
-        # 新增：回复相册找不到原映射时，按配置处理
+        # 回复消息找不到原映射时，按配置处理
         if first.reply_to and not reply_to_target_id and not ALLOW_REPLY_WITHOUT_MAPPING:
             log(f"拦截: 回复相册未找到原消息映射 | 首条消息ID: {first.id} | 回复的原消息ID: {first.reply_to.reply_to_msg_id}")
             return
 
-        # 发送相册，兼容原有逻辑
+        # 发送相册，和你原有逻辑完全一致
         sent_msg = await safe_send_album(
             target=target_entity,
             files=[m.media for m in msgs if m.media],
@@ -379,7 +395,7 @@ async def album_handler(event):
             reply_to=reply_to_target_id
         )
 
-        # 新增：保存消息ID映射，重启不丢失
+        # 保存消息ID映射
         if sent_msg:
             sent_msg = sent_msg[0]
             await save_message_mapping(
@@ -392,6 +408,7 @@ async def album_handler(event):
 
     except Exception as e:
         log(f"相册处理错误: {e}")
+
 
 # ========= 编辑事件拦截（你原有代码，完全未改动，仅适配多频道） =========
 async def edit_handler(event):
