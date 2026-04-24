@@ -424,9 +424,11 @@ async def resolve_and_bind():
         try:
             source_entity = await client.get_entity(source_str)
             target_entity = await client.get_entity(target_str)
-            temp_channel_map[source_entity.id] = target_entity
-            temp_source_cache[source_entity.id] = source_entity
-            log(f"频道解析成功 | 监听频道: {source_entity.title} (ID:{source_entity.id}) | 目标频道: {target_entity.title} (ID:{target_entity.id})")
+            # 核心修复：统一用事件触发的完整频道ID（带-100前缀）做key
+            full_source_id = int(f"-100{source_entity.id}")
+            temp_channel_map[full_source_id] = target_entity
+            temp_source_cache[full_source_id] = source_entity
+            log(f"频道解析成功 | 监听频道: {source_entity.title} (完整ID:{full_source_id}) | 目标频道: {target_entity.title} (ID:{target_entity.id})")
         except Exception as e:
             log(f"频道解析失败 | 监听标识: {source_str} | 目标标识: {target_str} | 错误: {e}")
             raise SystemExit(1)
@@ -439,7 +441,7 @@ async def resolve_and_bind():
     log(f"共监听 {len(CHANNEL_MAP)} 个频道，全部绑定完成")
 
     # 绑定事件，兼容原有逻辑
-    source_chats = list(SOURCE_ENTITY_CACHE.values())
+    source_chats = list(temp_source_cache.values())
     client.add_event_handler(album_handler, events.Album(chats=source_chats))
     client.add_event_handler(message_handler, events.NewMessage(chats=source_chats))
     client.add_event_handler(edit_handler, events.MessageEdited(chats=source_chats))
