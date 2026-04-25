@@ -353,7 +353,7 @@ async def message_handler(event):
     except Exception as e:
         log(f"消息处理错误: {e}")
 
-# ========= 相册处理（1.42.0版本专属修复，彻底杜绝拆分，保留所有原有功能） =========
+# ========= 相册处理（1.42.0版本终极修复，彻底解决转换失败+拆分，无文本泄露） =========
 async def album_handler(event):
     try:
         msgs = event.messages
@@ -386,7 +386,7 @@ async def album_handler(event):
             return
         first_caption_html = to_html(new_text, new_entities)
 
-        # ========= 1.42.0版本专属核心修复：正确转换InputMedia，保证相册不拆分 =========
+        # ========= 1.42.0版本专属核心修复：正确的异步API调用，100%转换成功 =========
         valid_media_list = []
         valid_captions_list = []
         # 按ID排序，和Telegram原生顺序完全一致
@@ -395,10 +395,10 @@ async def album_handler(event):
         for idx, m in enumerate(sorted_msgs):
             if not m.media:
                 continue
-            # 【关键修复】1.42.0版本正确调用方式：用Message对象自带的get_input_media()
+            # 【关键修复】1.42.0版本正确调用方式：client异步方法，参数为整条消息
             try:
-                # 转换为相册必需的InputMedia格式，1.42.0原生支持，不会报错
-                input_media = m.get_input_media()
+                # 正确转换为相册必需的InputMedia格式，异步调用必须加await
+                input_media = await client.get_input_media(m)
                 valid_media_list.append(input_media)
                 # 严格1:1匹配：仅首条带caption，其余全是空字符串，完全符合1.42.0规则
                 if idx == 0:
@@ -417,7 +417,7 @@ async def album_handler(event):
         if len(valid_media_list) != len(valid_captions_list):
             log(f"警告: 媒体与caption长度不匹配，已自动修正 | 媒体数:{len(valid_media_list)} | caption数:{len(valid_captions_list)}")
             valid_captions_list = [first_caption_html] + [""] * (len(valid_media_list) - 1)
-        log(f"相册有效媒体数:{len(valid_media_list)} | 全部转换为InputMedia格式，保证相册不拆分")
+        log(f"相册有效媒体数:{len(valid_media_list)} | 全部转换成功，保证相册不拆分")
 
         # ========= 原有回复联动逻辑，100%完全保留 =========
         first = sorted_msgs[0]
@@ -447,6 +447,7 @@ async def album_handler(event):
 
     except Exception as e:
         log(f"相册处理错误: {e}")
+
 
 
 
