@@ -3,7 +3,7 @@ import copy
 import asyncio
 from datetime import datetime
 from telethon import TelegramClient, events
-from telethon.errors import FloodWaitError
+from telethon.errors import FloodWaitError, common
 from telethon.tl.types import MessageEntityBold
 from telethon.extensions import html as tl_html
 
@@ -11,7 +11,7 @@ from telethon.extensions import html as tl_html
 API_ID = 25559912
 API_HASH = "22d3bb9665ad7e6a86e89c1445672e07"
 SESSION = "session"   # 根目录下的 session.session
-RESTART_TIME = 72000  # 20小时
+RESTART_TIME = 43200  # 20小时
 TAIL_TEXT = "关注华人新闻: @hrxxw 投稿: @LimTGbot"
 
 # ========= 新增：回复联动&配置文件核心参数 =========
@@ -23,6 +23,17 @@ CHANNEL_CONFIG_FILE = "channel_config.txt"
 MESSAGE_MAPPING_FILE = "message_mapping.txt"
 
 client = TelegramClient(SESSION, API_ID, API_HASH)
+# ========= 全局异常捕获：解决TLObject解析错误导致的崩溃 =========
+def global_updates_error_handler(update_exception):
+    # 捕获协议解析错误，只打日志不崩溃
+    if isinstance(update_exception, common.TypeNotFoundError):
+        log(f"忽略Telegram协议不兼容包，不影响正常转发")
+        return
+    # 其他异常正常打印日志
+    log(f"更新循环异常: {update_exception}")
+
+# 给客户端绑定异常处理
+client.updates_error = global_updates_error_handler
 # ========= 新增：全局缓存变量（兼容原有单频道+新增多频道） =========
 CHANNEL_MAP = {}
 SOURCE_ENTITY_CACHE = {}
@@ -155,7 +166,7 @@ def pick_caption_from_album(event):
     entities = getattr(main_msg, "entities", None) or []
     
     # 打印排查日志，确认首条消息的文本内容
-    log(f"相册首条消息ID:{main_msg.id} | 提取到的文本长度:{len(txt)} | 文本内容:{txt[:100]}")
+    log(f"相册首条消息ID:{main_msg.id} | 提取到的文本长度:{len(txt)}")
     
     # 兜底兼容：全量遍历所有消息，找有效文本（极端场景兜底，和你原有逻辑一致）
     if not txt.strip():
